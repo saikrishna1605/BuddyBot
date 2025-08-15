@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Task-12 Murf AI 30-Day Challenge</title>
+    <link rel="icon" href="static/logo.jpeg" type="image/jpeg">
+    <link rel="stylesheet" href="static/styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <img src="static/logo.jpeg" alt="Murf AI Logo" class="logo">
+            <h1>Murf AI</h1>
+            <h2>Conversational AI Assistant</h2>
+            <!-- <p> </p> -->
+        </header>
+        
+        <main>
+            <div class="voice-agent">
+                <div class="reset-container">
+                    <button id="resetBtn" class="reset-button" type="button">
+                        <span class="reset-text">Reset Conversation</span>
+                    </button>
+                </div>
+                <h1>AI Voice Agent</h1>
+                <div class="main-controls">
+                    <div class="particle"></div>
+                    <div class="particle"></div>
+                    <div class="particle"></div>
+                    <div class="particle"></div>
+                    <div class="particle"></div>
+                    <button id="recordBtn" class="record-button" type="button">
+                        <div class="record-icon">
+                            <div class="record-dot"></div>
+                        </div>
+                        <span class="record-text">Start Recording</span>
+                    </button>
+                </div>
+                <div class="recording-indicator hidden" id="recordingIndicator">
+                    <div class="recording-dot"></div>
+                    <span id="recordingText">Recording in progress...</span>
+                </div>
+                <div class="processing-indicator hidden" id="processingIndicator">
+                    <div class="spinner"></div>
+                    <span id="processingText">Processing...</span>
+                </div>
+                
+                <!-- Chat Container for conversation history -->
+                <div id="chatContainer"></div>
+                
+                <div class="audio-container hidden">
+                    <audio id="audioPlayback" controls></audio>
+                </div>
+                <div id="transcribeContainer" class="hidden">
+                    <button id="transcribeBtn" type="button" class="hidden-button">Re-process Echo</button>
+                    <p id="transcribingStatus" class="hidden">Processing echo...</p>
+                </div>
+                <div id="transcriptionResult" class="result hidden">
+                    <h3 id="resultTitle">What you said:</h3>
+                    <p id="transcriptionText"></p>
+                    <div id="llmResponseSection" class="hidden">
+                        <h3>AI Response:</h3>
+                        <p id="llmResponseText"></p>
+                    </div>
+                    <div id="chatInfo" class="hidden">
+                        <p><small>Messages in conversation: <span id="messageCount">0</span></small></p>
+                    </div>
+                </div>
+                
+                <div id="error" class="error hidden">
+                    <h3>Error</h3>
+                    <p id="errorMessage"></p>
+                </div>
+            </div>
+
+            
+        </main>
+    </div>
+    
+    <script src="static/script.js"></script>
+</body>
+</html>
+</html>
+
