@@ -12,6 +12,7 @@ document.addEventListener('DOMContentLoaded', function() {
     let audioChunks = [];
     let isRecording = false;
     let currentSessionId = 'session_' + Date.now();
+    let websocket = null;
     
     // Chat history functions
     function saveChatHistory(sessionId, messages) {
@@ -132,6 +133,28 @@ document.addEventListener('DOMContentLoaded', function() {
     
     async function startRecording() {
         try {
+            // Establish WebSocket connection
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            websocket = new WebSocket(wsUrl);
+            
+            websocket.onopen = function() {
+                console.log('WebSocket connection established');
+            };
+            
+            websocket.onmessage = function(event) {
+                console.log('Server response:', event.data);
+            };
+            
+            websocket.onerror = function(error) {
+                console.error('WebSocket error:', error);
+                showError('WebSocket connection error');
+            };
+            
+            websocket.onclose = function() {
+                console.log('WebSocket connection closed');
+            };
+            
             // Request microphone access
             const stream = await navigator.mediaDevices.getUserMedia({ 
                 audio: {
@@ -141,29 +164,36 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
             });
             
-            mediaRecorder = new MediaRecorder(stream);
+            mediaRecorder = new MediaRecorder(stream, {
+                mimeType: 'audio/webm;codecs=opus'
+            });
             audioChunks = [];
             
             mediaRecorder.ondataavailable = (event) => {
-                if (event.data.size > 0) {
-                    audioChunks.push(event.data);
+                if (event.data.size > 0 && websocket && websocket.readyState === WebSocket.OPEN) {
+                    // Stream audio chunk to server via WebSocket
+                    const reader = new FileReader();
+                    reader.onload = function() {
+                        websocket.send(reader.result);
+                        console.log(`Sent audio chunk: ${event.data.size} bytes`);
+                    };
+                    reader.readAsArrayBuffer(event.data);
                 }
             };
             
             mediaRecorder.onstop = async () => {
                 stream.getTracks().forEach(track => track.stop());
                 
-                const audioBlob = new Blob(audioChunks, { type: 'audio/wav' });
-                
-                if (audioBlob.size < 1000) {
-                    showError('Recording too short. Please try again.');
-                    return;
+                // Close WebSocket connection when recording stops
+                if (websocket) {
+                    websocket.close();
                 }
                 
-                await processAudio(audioBlob);
+                console.log('Recording stopped and WebSocket closed');
             };
             
-            mediaRecorder.start();
+            // Start recording and request data every 1000ms (1 second intervals)
+            mediaRecorder.start(1000);
             isRecording = true;
             
             // Update UI
@@ -189,6 +219,11 @@ document.addEventListener('DOMContentLoaded', function() {
     function stopRecording() {
         if (mediaRecorder && mediaRecorder.state !== 'inactive') {
             mediaRecorder.stop();
+        }
+        
+        // Close WebSocket if still open
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+            websocket.close();
         }
         
         isRecording = false;

@@ -257,18 +257,67 @@ app = FastAPI(
     version="2.0.0"
 )
 
-# Mount static files
-app.mount("/static", StaticFiles(directory="../static"), name="static")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# ===== WEBSOCKET ENDPOINT =====
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for streaming audio data"""
     await websocket.accept()
-    while True:
-        data = await websocket.receive_text()
-        await websocket.send_text(f"Echo: {data}")
+    logger.info("WebSocket connection established")
+    
 
-# ===== ROUTES =====
+    session_id = f"stream_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    audio_filename = f"uploads/streamed_audio_{session_id}.wav"
+    
+    try:
+        os.makedirs("uploads", exist_ok=True)
+        
+        audio_chunks = []
+        
+        while True:
+            try:
+                try:
+                    data = await websocket.receive_bytes()
+                    if data:
+                        audio_chunks.append(data)
+                        logger.info(f"Received audio chunk: {len(data)} bytes")
+                        
+                        await websocket.send_text(f"Received chunk: {len(data)} bytes")
+                except:
+                    try:
+                        text_data = await websocket.receive_text()
+                        logger.info(f"Received text: {text_data}")
+                        await websocket.send_text(f"Echo: {text_data}")
+                    except:
+                        break
+                    
+            except Exception as e:
+                logger.error(f"Error in WebSocket loop: {str(e)}")
+                break
+                
+    except Exception as e:
+        logger.error(f"WebSocket error: {str(e)}")
+    finally:
+        if audio_chunks:
+            try:
+                with open(audio_filename, "wb") as f:
+                    for chunk in audio_chunks:
+                        f.write(chunk)
+                
+                total_size = sum(len(chunk) for chunk in audio_chunks)
+                logger.info(f"Saved streamed audio to {audio_filename} - Total size: {total_size} bytes")
+                
+                try:
+                    if websocket.client_state.name == "CONNECTED":
+                        await websocket.send_text(f"Audio saved: {audio_filename} - {total_size} bytes")
+                except:
+                    logger.info(f"Connection closed before sending confirmation. Audio saved successfully.")
+                
+            except Exception as e:
+                logger.error(f"Error saving audio file: {str(e)}")
+        
+        logger.info("WebSocket connection closed")
+
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     """Serve the main web interface"""
@@ -310,22 +359,19 @@ async def conversation_pipeline(session_id: str, file: UploadFile = File(...)):
     try:
         logger.info(f"Starting conversation for session {session_id}")
         
-        # Step 1: Speech-to-Text
+        
         transcribed_text, stt_status = await transcribe_audio(file.file)
         if stt_status != "success":
             return await generate_fallback_response(FALLBACK_RESPONSES["stt_error"], session_id)
         
-        # Step 2: Add user message and get LLM response
         chat_manager.add_message(session_id, "user", transcribed_text)
         chat_history = chat_manager.get_history(session_id)
         
         llm_text, llm_status = await generate_llm_response(transcribed_text, chat_history)
         
-        # Step 3: Add assistant message
         chat_manager.add_message(session_id, "assistant", llm_text)
         message_count = chat_manager.get_message_count(session_id)
         
-        # Step 4: Text-to-Speech
         audio_url, tts_status = await generate_speech(llm_text)
         
         return ConversationResponse(
