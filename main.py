@@ -1,71 +1,74 @@
-"""
-BuddyBot - AI Voice Assistant
-A conversational voice AI built with FastAPI, AssemblyAI, Google Gemini, and Murf AI
-Simplified version with minimal dependencies and clean structure.
-"""
-import os
-import asyncio
-import logging
-from datetime import datetime
-from typing import Dict, List, Optional
-from io import BytesIO
 
-# FastAPI imports
-from fastapi import FastAPI, HTTPException, File, UploadFile, WebSocket
+#add req imports 
+
+from fastapi import FastAPI, UploadFile, File, Request, Path, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
-
-# External service imports
+from dotenv import load_dotenv
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+from pathlib import Path
+import tempfile
+import requests
+import os
+import json
+import logging
+import asyncio
 import httpx
 import assemblyai as aai
-import google.generativeai as genai
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
-
-# ===== CONFIGURATION =====
-class AppConfig:
-    """Application configuration"""
-    ASSEMBLYAI_API_KEY = os.getenv("ASSEMBLYAI_API_KEY")
-    GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-    MURF_API_KEY = os.getenv("MURF_API_KEY")
-    
-    HOST = os.getenv("HOST", "0.0.0.0")
-    PORT = int(os.getenv("PORT", 8000))
-    DEBUG = os.getenv("DEBUG", "false").lower() == "true"
-    
-    MURF_API_URL = "https://api.murf.ai/v1/speech/generate"
-    MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
-    TRANSCRIPTION_TIMEOUT = 60
-    LLM_TIMEOUT = 30
-    TTS_TIMEOUT = 45
-    MAX_LLM_RESPONSE_LENGTH = 3000
-
-config = AppConfig()
-
-# ===== LOGGING SETUP =====
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+from assemblyai.streaming.v3 import (
+    BeginEvent,
+    StreamingClient,
+    StreamingClientOptions,
+    StreamingError,
+    StreamingEvents,
+    StreamingParameters,
+    StreamingSessionParameters,
+    TerminationEvent,
+    TurnEvent,
 )
+import google.generativeai as genai
+from services.turn_detection import TurnDetectionService
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ===== SERVICE INITIALIZATION =====
-def initialize_services():
-    """Initialize AI services"""
-    # AssemblyAI
-    if config.ASSEMBLYAI_API_KEY:
-        aai.settings.api_key = config.ASSEMBLYAI_API_KEY
-        logger.info("AssemblyAI configured successfully")
-    
-    # Google Gemini
-    if config.GEMINI_API_KEY:
-        genai.configure(api_key=config.GEMINI_API_KEY)
-        logger.info("Google Gemini configured successfully")
+# Load API keys
+load_dotenv()
+MURF_KEY = os.getenv("MURF_API_KEY")
+ASSEMBLY_KEY = os.getenv("ASSEMBLYAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-initialize_services()
+# Configure APIs
+if ASSEMBLY_KEY:
+    aai.settings.api_key = ASSEMBLY_KEY
+    logger.info("AssemblyAI configured successfully")
+else:
+    logger.warning("ASSEMBLYAI_API_KEY missing - speech recognition will fail")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    logger.info("Google Gemini configured successfully")
+else:
+    logger.warning("GEMINI_API_KEY missing - AI responses will fail")
+
+if MURF_KEY:
+    logger.info("Murf API key loaded successfully")
+else:
+    logger.warning("MURF_API_KEY missing - voice synthesis will fail")
+
+# Configuration Constants
+HOST = "localhost"
+PORT = 8080
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB
+TRANSCRIPTION_TIMEOUT = 30
+LLM_TIMEOUT = 30
+TTS_TIMEOUT = 30
+MAX_LLM_RESPONSE_LENGTH = 2000
+MURF_API_URL = "https://api.murf.ai/v1/speech/generate"
 
 # ===== DATA MODELS =====
 class ChatMessage(BaseModel):
@@ -119,21 +122,63 @@ class ChatManager:
             return True
         return False
 
+# Global variable to store recent transcriptions
+recent_transcriptions = []
+
+def add_transcription_to_cache(text: str, session_id: str):
+    """Add transcription to recent cache for fallback retrieval"""
+    global recent_transcriptions
+    transcription = {
+        "text": text,
+        "session_id": session_id,
+        "timestamp": datetime.now().isoformat()
+    }
+    recent_transcriptions.append(transcription)
+    # Keep only last 10 transcriptions
+    recent_transcriptions = recent_transcriptions[-10:]
+
 chat_manager = ChatManager()
 
 # ===== AI SERVICES =====
 async def transcribe_audio(audio_file) -> tuple[str, str]:
     """Transcribe audio using AssemblyAI"""
     try:
-        if not config.ASSEMBLYAI_API_KEY:
+        if not ASSEMBLY_KEY:
             return "", "STT service not configured"
         
+        # Prepare an input path for the transcriber (it expects a path/URL)
+        input_path: Optional[str] = None
+        temp_path: Optional[Path] = None
+
+        # If a string/path-like provided
+        if isinstance(audio_file, (str, Path)):
+            input_path = str(audio_file)
+        else:
+            # Assume it's a file-like; read bytes and write to a temp .webm file
+            def _read_bytes(fobj):
+                # Try to read from beginning
+                try:
+                    fobj.seek(0)
+                except Exception:
+                    pass
+                return fobj.read()
+
+            data: bytes = await asyncio.to_thread(_read_bytes, audio_file)
+            if not data:
+                return "", "Empty audio"
+
+            # Write to temp file with a generic webm suffix (AssemblyAI supports webm/opus)
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".webm") as tmp:
+                tmp.write(data)
+                temp_path = Path(tmp.name)
+                input_path = tmp.name
+
         config_obj = aai.TranscriptionConfig(speech_model=aai.SpeechModel.best)
         transcriber = aai.Transcriber(config=config_obj)
-        
+
         transcript = await asyncio.wait_for(
-            asyncio.to_thread(transcriber.transcribe, audio_file),
-            timeout=config.TRANSCRIPTION_TIMEOUT
+            asyncio.to_thread(transcriber.transcribe, input_path),
+            timeout=TRANSCRIPTION_TIMEOUT
         )
         
         if transcript.status == aai.TranscriptStatus.error:
@@ -148,11 +193,18 @@ async def transcribe_audio(audio_file) -> tuple[str, str]:
         return "", "Transcription timeout"
     except Exception as e:
         return "", f"Transcription failed: {str(e)}"
+    finally:
+        # Cleanup temp file if created
+        try:
+            if 'temp_path' in locals() and temp_path and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 async def generate_llm_response(text: str, chat_history: List[ChatMessage] = None) -> tuple[str, str]:
     """Generate LLM response using Google Gemini"""
     try:
-        if not config.GEMINI_API_KEY:
+        if not GEMINI_API_KEY:
             return "I'm having trouble connecting to my AI brain right now.", "LLM not configured"
         
         # Build context
@@ -170,7 +222,7 @@ async def generate_llm_response(text: str, chat_history: List[ChatMessage] = Non
         model = genai.GenerativeModel('gemini-1.5-flash')
         response = await asyncio.wait_for(
             asyncio.to_thread(model.generate_content, context),
-            timeout=config.LLM_TIMEOUT
+            timeout=LLM_TIMEOUT
         )
         
         if not response.text:
@@ -179,7 +231,7 @@ async def generate_llm_response(text: str, chat_history: List[ChatMessage] = Non
         response_text = response.text.strip()
         
         # Truncate if too long
-        if len(response_text) > config.MAX_LLM_RESPONSE_LENGTH:
+        if len(response_text) > MAX_LLM_RESPONSE_LENGTH:
             response_text = response_text[:2900] + "... I have more to share, but let me pause here."
         
         return response_text, "success"
@@ -192,14 +244,14 @@ async def generate_llm_response(text: str, chat_history: List[ChatMessage] = Non
 async def generate_speech(text: str, voice_id: str = "en-US-natalie") -> tuple[Optional[str], str]:
     """Generate speech using Murf AI"""
     try:
-        if not config.MURF_API_KEY:
+        if not MURF_KEY:
             return None, "TTS not configured"
         
         if not text or len(text) > 5000:
             return None, "Invalid text for TTS"
         
         headers = {
-            "api-key": config.MURF_API_KEY.strip('"\''),
+            "api-key": MURF_KEY.strip('"\''),
             "Content-Type": "application/json"
         }
         
@@ -210,8 +262,8 @@ async def generate_speech(text: str, voice_id: str = "en-US-natalie") -> tuple[O
             "sampleRate": 44100
         }
         
-        async with httpx.AsyncClient(timeout=config.TTS_TIMEOUT) as client:
-            response = await client.post(config.MURF_API_URL, json=payload, headers=headers)
+        async with httpx.AsyncClient(timeout=TTS_TIMEOUT) as client:
+            response = await client.post(MURF_API_URL, json=payload, headers=headers)
             
             if response.status_code == 200:
                 result = response.json()
@@ -259,65 +311,274 @@ app = FastAPI(
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-@app.websocket("/ws")
-async def websocket_endpoint(websocket: WebSocket):
-    """WebSocket endpoint for streaming audio data"""
+import threading
+
+# AssemblyAI Universal Streaming endpoint
+@app.websocket("/ws/streaming")
+async def streaming_ws(websocket: WebSocket):
+    """WebSocket endpoint for real-time transcription with turn detection using Universal Streaming."""
     await websocket.accept()
-    logger.info("WebSocket connection established")
+    logger.info("Streaming WebSocket connection established")
     
+    # Store the main event loop for thread-safe access
+    main_loop = asyncio.get_running_loop()
+    
+    session_id = f"streaming_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    session_id = f"stream_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    audio_filename = f"uploads/streamed_audio_{session_id}.wav"
-    
+    if not ASSEMBLY_KEY:
+        await websocket.send_text(json.dumps({"type": "error", "message": "AssemblyAI API key not configured"}))
+        await websocket.close()
+        return
+
+    # Create a queue to communicate between event handlers and the main loop
+    message_queue = asyncio.Queue()
+    # Track latest partial transcript and whether a final was sent
+    latest_transcript_text: Optional[str] = None
+    got_final_transcript: bool = False
+
+    # Create streaming client with the new Universal Streaming API
+    streaming_client = StreamingClient(
+        StreamingClientOptions(
+            api_key=ASSEMBLY_KEY,
+            api_host="streaming.assemblyai.com"
+        )
+    )
+
+    # Event handlers for the Universal Streaming API
+    def on_begin(client, event: BeginEvent):
+        logger.info(f"Streaming session started: {event.id}")
+
+    def on_turn(client, event: TurnEvent):
+        """Handle turn events with transcript data"""
+        try:
+            nonlocal latest_transcript_text, got_final_transcript
+            logger.info(f"Turn event received - Turn order: {event.turn_order}, End of turn: {event.end_of_turn}, Transcript: {event.transcript}")
+            
+            # Send partial transcript while speaking
+            if not event.end_of_turn and event.transcript:
+                logger.info(f"Partial transcript: {event.transcript}")
+                latest_transcript_text = event.transcript
+                asyncio.run_coroutine_threadsafe(
+                    message_queue.put({
+                        "type": "partial_transcript",
+                        "text": event.transcript,
+                        "session_id": session_id,
+                        "turn_order": event.turn_order
+                    }),
+                    main_loop
+                )
+            
+            # Send final transcript when turn ends
+            elif event.end_of_turn and event.transcript:
+                logger.info(f"Turn {event.turn_order} completed: {event.transcript}")
+                got_final_transcript = True
+                
+                # Add to recent transcriptions for fallback mechanism
+                recent_transcriptions.append({
+                    "text": event.transcript,
+                    "session_id": session_id,
+                    "timestamp": datetime.now().isoformat()
+                })
+                # Trim list if it gets too large
+                if len(recent_transcriptions) > 100:
+                    recent_transcriptions.pop(0)
+                
+                asyncio.run_coroutine_threadsafe(
+                    message_queue.put({
+                        "type": "final_transcript",
+                        "text": event.transcript,
+                        "session_id": session_id,
+                        "turn_order": event.turn_order,
+                        "is_formatted": event.turn_is_formatted
+                    }),
+                    main_loop
+                )
+
+                # Explicitly notify client the turn ended
+                asyncio.run_coroutine_threadsafe(
+                    message_queue.put({
+                        "type": "turn_end",
+                        "session_id": session_id,
+                        "turn_order": event.turn_order
+                    }),
+                    main_loop
+                )
+                
+            # Handle case where we have transcript but no explicit end of turn
+            elif event.transcript and not hasattr(event, 'end_of_turn'):
+                logger.info(f"Transcript received without clear turn end: {event.transcript}")
+                latest_transcript_text = event.transcript
+                # Add to recent transcriptions for fallback
+                recent_transcriptions.append({
+                    "text": event.transcript,
+                    "session_id": session_id,
+                    "timestamp": datetime.now().isoformat()
+                })
+                
+                asyncio.run_coroutine_threadsafe(
+                    message_queue.put({
+                        "type": "partial_transcript",
+                        "text": event.transcript,
+                        "session_id": session_id,
+                        "turn_order": event.turn_order
+                    }),
+                    main_loop
+                )
+                
+        except Exception as e:
+            logger.error(f"Error handling turn event: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+
+    def on_terminated(client, event: TerminationEvent):
+        logger.info(f"Streaming session terminated: {event.audio_duration_seconds} seconds processed")
+
+    def on_error(client, error: StreamingError):
+        logger.error(f"Universal Streaming error: {error}")
+        try:
+            asyncio.run_coroutine_threadsafe(
+                message_queue.put({
+                    "type": "error",
+                    "message": str(error)
+                }),
+                main_loop
+            )
+        except RuntimeError as e:
+            logger.error(f"Could not send error to queue (no event loop): {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error in error handler: {e}")
+
+    # Register event handlers
+    streaming_client.on(StreamingEvents.Begin, on_begin)
+    streaming_client.on(StreamingEvents.Turn, on_turn)
+    streaming_client.on(StreamingEvents.Termination, on_terminated)
+    streaming_client.on(StreamingEvents.Error, on_error)
+
     try:
-        os.makedirs("uploads", exist_ok=True)
+        # Connect to AssemblyAI Universal Streaming
+        # We stream raw PCM16 at 16kHz to the server (matches client-side WebAudio pipeline)
+        streaming_client.connect(
+            StreamingParameters(
+                sample_rate=16000,
+                format_turns=True,
+                encoding="pcm_s16le"
+            )
+        )
         
-        audio_chunks = []
-        
-        while True:
-            try:
-                try:
-                    data = await websocket.receive_bytes()
-                    if data:
-                        audio_chunks.append(data)
-                        logger.info(f"Received audio chunk: {len(data)} bytes")
-                        
-                        await websocket.send_text(f"Received chunk: {len(data)} bytes")
-                except:
-                    try:
-                        text_data = await websocket.receive_text()
-                        logger.info(f"Received text: {text_data}")
-                        await websocket.send_text(f"Echo: {text_data}")
-                    except:
-                        break
-                    
-            except Exception as e:
-                logger.error(f"Error in WebSocket loop: {str(e)}")
-                break
-                
-    except Exception as e:
-        logger.error(f"WebSocket error: {str(e)}")
-    finally:
-        if audio_chunks:
-            try:
-                with open(audio_filename, "wb") as f:
-                    for chunk in audio_chunks:
-                        f.write(chunk)
-                
-                total_size = sum(len(chunk) for chunk in audio_chunks)
-                logger.info(f"Saved streamed audio to {audio_filename} - Total size: {total_size} bytes")
-                
-                try:
-                    if websocket.client_state.name == "CONNECTED":
-                        await websocket.send_text(f"Audio saved: {audio_filename} - {total_size} bytes")
-                except:
-                    logger.info(f"Connection closed before sending confirmation. Audio saved successfully.")
-                
-            except Exception as e:
-                logger.error(f"Error saving audio file: {str(e)}")
-        
-        logger.info("WebSocket connection closed")
+        await websocket.send_text(json.dumps({
+            "type": "connection_established",
+            "message": "Universal Streaming transcription with turn detection ready",
+            "session_id": session_id
+        }))
 
+        # Create tasks for handling audio input and message output
+        async def handle_client_audio():
+            """Handle audio streaming from client"""
+            finalization_timeout = 3.0  # reserved: seconds of silence before finalizing (not used yet)
+            
+            while True:
+                try:
+                    message = await websocket.receive()
+                    if "bytes" in message:
+                        # Stream audio data to AssemblyAI
+                        streaming_client.stream(message["bytes"])
+                        
+                        # Send audio received confirmation (optional, for debugging)
+                        await websocket.send_text(json.dumps({
+                            "type": "audio_received",
+                            "bytes": len(message["bytes"]),
+                            "session_id": session_id
+                        }))
+                        
+                    elif "text" in message and message["text"] == "stop_streaming":
+                        logger.info("Client requested to stop streaming.")
+                        # If no final transcript was produced, emit the latest partial as final
+                        if not got_final_transcript and latest_transcript_text:
+                            logger.info(f"Finalizing transcript on stop (fallback): {latest_transcript_text}")
+                            recent_transcriptions.append({
+                                "text": latest_transcript_text,
+                                "session_id": session_id,
+                                "timestamp": datetime.now().isoformat()
+                            })
+                            await message_queue.put({
+                                "type": "final_transcript",
+                                "text": latest_transcript_text,
+                                "session_id": session_id,
+                                "turn_order": 1
+                            })
+                        # Terminate streaming session gracefully
+                        try:
+                            streaming_client.disconnect(terminate=True)
+                        except Exception:
+                            pass
+                        # Gracefully close the websocket
+                        try:
+                            await websocket.close(code=1000)
+                        except Exception:
+                            pass
+                        break
+                except WebSocketDisconnect:
+                    logger.info("Client disconnected during streaming.")
+                    break
+                except Exception as e:
+                    logger.error(f"Error receiving audio: {e}")
+                    break
+
+        async def handle_transcript_messages():
+            """Handle messages from AssemblyAI and send to client"""
+            message_count = 0
+            while True:
+                try:
+                    # Wait for messages from the event handlers
+                    message = await asyncio.wait_for(message_queue.get(), timeout=1.0)
+                    message_count += 1
+                    logger.info(f"Sending message #{message_count} to client: {message['type']}")
+                    await websocket.send_text(json.dumps(message))
+                    
+                    # If this is a final transcript, we can break the loop
+                    if message.get('type') == 'final_transcript':
+                        logger.info("Final transcript sent, ending message handler")
+                        break
+                        
+                except asyncio.TimeoutError:
+                    continue
+                except Exception as e:
+                    logger.error(f"Error sending transcript message: {e}")
+                    break
+
+        # Run both tasks concurrently
+        await asyncio.gather(
+            handle_client_audio(),
+            handle_transcript_messages()
+        )
+
+    except Exception as e:
+        logger.error(f"Universal Streaming WebSocket error: {e}")
+    finally:
+        # Cleanly close the streaming connection
+        try:
+            streaming_client.disconnect(terminate=True)
+        except:
+            pass
+        logger.info("Universal Streaming WebSocket connection closed")
+
+
+# Dedicated, minimal turn-detection-only WebSocket endpoint
+@app.websocket("/ws/turn-detection")
+async def turn_detection_ws(websocket: WebSocket):
+    """Separate endpoint for Day 18: Turn Detection (no overlap with main pipeline)."""
+    if not ASSEMBLY_KEY:
+        await websocket.accept()
+        await websocket.send_text(json.dumps({
+            "type": "error",
+            "message": "AssemblyAI API key not configured"
+        }))
+        await websocket.close()
+        return
+
+    service = TurnDetectionService(api_key=ASSEMBLY_KEY)
+    # Delegate all handling to the focused service
+    await service.stream_handler(websocket, ASSEMBLY_KEY)
 @app.get("/", response_class=HTMLResponse)
 async def read_root():
     """Serve the main web interface"""
@@ -334,9 +595,9 @@ async def read_root():
 async def health_check():
     """Health check endpoint"""
     services = {
-        "speech_to_text": "available" if config.ASSEMBLYAI_API_KEY else "unavailable",
-        "llm": "available" if config.GEMINI_API_KEY else "unavailable",
-        "text_to_speech": "available" if config.MURF_API_KEY else "unavailable"
+        "speech_to_text": "available" if ASSEMBLY_KEY else "unavailable",
+        "llm": "available" if GEMINI_API_KEY else "unavailable",
+        "text_to_speech": "available" if MURF_KEY else "unavailable"
     }
     
     available_count = sum(1 for status in services.values() if status == "available")
@@ -417,13 +678,23 @@ async def clear_chat_history(session_id: str):
         "status": "success"
     }
 
+@app.get("/recent-transcriptions")
+async def get_recent_transcriptions():
+    """Get recent transcriptions as fallback when WebSocket fails"""
+    global recent_transcriptions
+    return {
+        "transcriptions": recent_transcriptions,
+        "count": len(recent_transcriptions),
+        "message": "Recent transcription results"
+    }
+
 @app.post("/transcribe/file")
 async def transcribe_file(file: UploadFile = File(...)):
     """Transcribe audio file to text"""
     if not file.filename or not file.size:
         raise HTTPException(status_code=400, detail="Invalid audio file")
     
-    if file.size > config.MAX_FILE_SIZE:
+    if file.size > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File too large (max 50MB)")
     
     transcription, status = await transcribe_audio(file.file)
@@ -473,12 +744,12 @@ async def startup_event():
     logger.info("=" * 50)
     logger.info("BuddyBot - AI Voice Assistant Starting Up")
     logger.info("=" * 50)
-    logger.info(f"Host: {config.HOST}:{config.PORT}")
-    logger.info(f"AssemblyAI: {'Configured' if config.ASSEMBLYAI_API_KEY else 'Missing'}")
-    logger.info(f"Gemini LLM: {'Configured' if config.GEMINI_API_KEY else 'Missing'}")
-    logger.info(f"Murf TTS: {'Configured' if config.MURF_API_KEY else 'Missing'}")
+    logger.info(f"Host: {HOST}:{PORT}")
+    logger.info(f"AssemblyAI: {'Configured' if ASSEMBLY_KEY else 'Missing'}")
+    logger.info(f"Gemini LLM: {'Configured' if GEMINI_API_KEY else 'Missing'}")
+    logger.info(f"Murf TTS: {'Configured' if MURF_KEY else 'Missing'}")
     logger.info("BuddyBot is ready to chat!")
-    logger.info(f"Open: http://{config.HOST}:{config.PORT}")
+    logger.info(f"Open: http://{HOST}:{PORT}")
     logger.info("=" * 50)
 
 if __name__ == "__main__":
@@ -486,7 +757,7 @@ if __name__ == "__main__":
     logger.info("Starting BuddyBot server...")
     uvicorn.run(
         "main:app",
-        host=config.HOST,
-        port=config.PORT,
-        reload=config.DEBUG
+        host=HOST,
+        port=PORT,
+        reload=False
     )

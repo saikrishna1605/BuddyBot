@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Meyme - AI Voice Agent</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        
+        .container {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            max-width: 600px;
+            width: 100%;
+            text-align: center;
+        }
+        
+        .logo {
+            width: 80px;
+            height: 80px;
+            background: linear-gradient(135deg, #ff6b6b, #ffa726);
+            border-radius: 50%;
+            margin: 0 auto 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 30px;
+        }
+        
+        h1 {
+            color: #333;
+            margin-bottom: 10px;
+            font-weight: 700;
+        }
+        
+        .subtitle {
+            color: #666;
+            margin-bottom: 30px;
+            font-size: 16px;
+        }
+        
+        .audio-controls {
+            margin: 20px 0;
+        }
+        
+        .record-btn {
+            background: linear-gradient(135deg, #ff6b6b, #ee5a52);
+            color: white;
+            border: none;
+            border-radius: 50px;
+            padding: 15px 30px;
+            font-size: 16px;
+            cursor: pointer;
+            margin: 10px;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(255, 107, 107, 0.3);
+        }
+        
+        .record-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(255, 107, 107, 0.4);
+        }
+        
+        .record-btn.recording {
+            background: linear-gradient(135deg, #ff4757, #c44569);
+            animation: pulse 1.5s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { box-shadow: 0 4px 15px rgba(255, 107, 107, 0.3); }
+            50% { box-shadow: 0 4px 25px rgba(255, 107, 107, 0.6); }
+            100% { box-shadow: 0 4px 15px rgba(255, 107, 107, 0.3); }
+        }
+        
+        .websocket-btn {
+            background: linear-gradient(135deg, #4834d4, #686de0);
+            color: white;
+            border: none;
+            border-radius: 50px;
+            padding: 15px 30px;
+            font-size: 16px;
+            cursor: pointer;
+            margin: 10px;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(72, 52, 212, 0.3);
+        }
+        
+        .websocket-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(72, 52, 212, 0.4);
+        }
+        
+        .websocket-btn.connected {
+            background: linear-gradient(135deg, #0be881, #00d2d3);
+        }
+        
+        .chat-container {
+            background: #f8f9fa;
+            border-radius: 15px;
+            padding: 20px;
+            margin: 20px 0;
+            max-height: 300px;
+            overflow-y: auto;
+            text-align: left;
+        }
+        
+        .message {
+            margin: 10px 0;
+            padding: 10px 15px;
+            border-radius: 15px;
+            max-width: 80%;
+        }
+        
+        .message.user {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            margin-left: auto;
+        }
+        
+        .message.assistant {
+            background: linear-gradient(135deg, #ffeaa7, #fab1a0);
+            color: #2d3436;
+        }
+        
+        .transcript-area {
+            background: #e9ecef;
+            border-radius: 10px;
+            padding: 15px;
+            margin: 15px 0;
+            min-height: 100px;
+            border: 2px dashed #ced4da;
+            font-style: italic;
+            color: #6c757d;
+        }
+        
+        .status {
+            margin: 10px 0;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 14px;
+            display: inline-block;
+        }
+        
+        .status.info {
+            background: #d1ecf1;
+            color: #0c5460;
+        }
+        
+        .status.success {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .audio-player {
+            margin: 15px 0;
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="logo">🐱</div>
+        <h1>Meyme</h1>
+        <p class="subtitle">Your fiercely loyal AI voice companion</p>
+        
+        <div class="audio-controls">
+            <button id="recordBtn" class="record-btn">🎙️ Record Audio</button>
+            <button id="wsBtn" class="websocket-btn">🔗 Connect WebSocket</button>
+        </div>
+        
+        <div id="status" class="status info">Ready to chat</div>
+        
+        <div id="chatContainer" class="chat-container">
+            <div class="message assistant">
+                <strong>Meyme:</strong> *stretches and yawns* Well, well... another human wants my attention. How... predictable. 😏 Go ahead, speak up – but make it worth my time.
+            </div>
+        </div>
+        
+        <div id="transcriptArea" class="transcript-area">
+            Live transcription will appear here...
+        </div>
+        
+        <audio id="audioPlayer" class="audio-player" controls style="display: none;"></audio>
+    </div>
+
+    <script>
+        let isRecording = false;
+        let mediaRecorder = null;
+        let audioChunks = [];
+        let websocket = null;
+        let isWebSocketConnected = false;
+        
+        const recordBtn = document.getElementById('recordBtn');
+        const wsBtn = document.getElementById('wsBtn');
+        const status = document.getElementById('status');
+        const chatContainer = document.getElementById('chatContainer');
+        const transcriptArea = document.getElementById('transcriptArea');
+        const audioPlayer = document.getElementById('audioPlayer');
+        
+        // Generate session ID
+        const sessionId = 'session_' + Date.now();
+        
+        // Record Audio for Chat Pipeline
+        recordBtn.addEventListener('click', async () => {
+            if (!isRecording) {
+                startRecording();
+            } else {
+                stopRecording();
+            }
+        });
+        
+        // WebSocket Connection
+        wsBtn.addEventListener('click', () => {
+            if (!isWebSocketConnected) {
+                connectWebSocket();
+            } else {
+                disconnectWebSocket();
+            }
+        });
+        
+        async function startRecording() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                mediaRecorder = new MediaRecorder(stream);
+                audioChunks = [];
+                
+                mediaRecorder.ondataavailable = (event) => {
+                    audioChunks.push(event.data);
+                };
+                
+                mediaRecorder.onstop = async () => {
+                    const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                    await sendAudioToChat(audioBlob);
+                };
+                
+                mediaRecorder.start();
+                isRecording = true;
+                recordBtn.textContent = '⏹️ Stop Recording';
+                recordBtn.classList.add('recording');
+                updateStatus('Recording...', 'info');
+                
+            } catch (error) {
+                console.error('Error starting recording:', error);
+                updateStatus('Microphone access denied', 'error');
+            }
+        }
+        
+        function stopRecording() {
+            if (mediaRecorder && isRecording) {
+                mediaRecorder.stop();
+                mediaRecorder.stream.getTracks().forEach(track => track.stop());
+                isRecording = false;
+                recordBtn.textContent = '🎙️ Record Audio';
+                recordBtn.classList.remove('recording');
+                updateStatus('Processing...', 'info');
+            }
+        }
+        
+        async function sendAudioToChat(audioBlob) {
+            const formData = new FormData();
+            formData.append('audio_file', audioBlob, 'audio.webm');
+            
+            try {
+                updateStatus('Sending to Meyme...', 'info');
+                
+                const response = await fetch(`/agent/chat/${sessionId}`, {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                if (response.ok) {
+                    const result = await response.json();
+                    
+                    // Add user message
+                    addMessage('user', result.transcript || 'Audio processed');
+                    
+                    // Add Meyme's response
+                    addMessage('assistant', result.text);
+                    
+                    // Play audio response
+                    if (result.audio_url) {
+                        playAudio(result.audio_url);
+                    }
+                    
+                    updateStatus('Chat completed', 'success');
+                    
+                } else {
+                    updateStatus('Chat failed', 'error');
+                }
+                
+            } catch (error) {
+                console.error('Chat error:', error);
+                updateStatus('Connection error', 'error');
+            }
+        }
+        
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            
+            websocket = new WebSocket(wsUrl);
+            
+            websocket.onopen = async () => {
+                isWebSocketConnected = true;
+                wsBtn.textContent = '🔴 Disconnect';
+                wsBtn.classList.add('connected');
+                updateStatus('WebSocket connected - listening...', 'success');
+                transcriptArea.innerHTML = 'Connected! Start speaking...';
+                
+                // Start audio streaming
+                const stream = await navigator.mediaDevices.getUserMedia({ 
+                    audio: { 
+                        sampleRate: 16000,
+                        channelCount: 1 
+                    } 
+                });
+                
+                const mediaRecorder = new MediaRecorder(stream);
+                
+                mediaRecorder.ondataavailable = (event) => {
+                    if (websocket.readyState === WebSocket.OPEN && event.data.size > 0) {
+                        websocket.send(event.data);
+                    }
+                };
+                
+                mediaRecorder.start(100); // Send data every 100ms
+            };
+            
+            websocket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                
+                if (data.type === 'transcript') {
+                    if (data.end_of_turn && data.transcript) {
+                        transcriptArea.innerHTML = `<strong>Final:</strong> ${data.transcript}`;
+                        addMessage('user', data.transcript);
+                    } else if (data.transcript) {
+                        transcriptArea.innerHTML = `<em>Speaking:</em> ${data.transcript}`;
+                    }
+                }
+                
+                if (data.type === 'turn_end') {
+                    console.log('Turn ended with confidence:', data.confidence);
+                    updateStatus(`Turn ended (${Math.round(data.confidence * 100)}% confidence)`, 'info');
+                }
+            };
+            
+            websocket.onclose = () => {
+                isWebSocketConnected = false;
+                wsBtn.textContent = '🔗 Connect WebSocket';
+                wsBtn.classList.remove('connected');
+                updateStatus('WebSocket disconnected', 'info');
+                transcriptArea.innerHTML = 'Live transcription will appear here...';
+            };
+            
+            websocket.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                updateStatus('WebSocket error', 'error');
+            };
+        }
+        
+        function disconnectWebSocket() {
+            if (websocket) {
+                websocket.close();
+            }
+        }
+        
+        function addMessage(role, content) {
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role}`;
+            messageDiv.innerHTML = `<strong>${role === 'user' ? 'You' : 'Meyme'}:</strong> ${content}`;
+            chatContainer.appendChild(messageDiv);
+            chatContainer.scrollTop = chatContainer.scrollHeight;
+        }
+        
+        function updateStatus(message, type) {
+            status.textContent = message;
+            status.className = `status ${type}`;
+        }
+        
+        function playAudio(audioUrl) {
+            audioPlayer.src = audioUrl;
+            audioPlayer.style.display = 'block';
+            audioPlayer.play().catch(console.error);
+        }
+    </script>
+</body>
+</html>

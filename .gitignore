@@ -55,11 +55,14 @@ app.log
 ehthumbs.db
 Thumbs.db
 
-# Temporary files
+# Temporary files / uploads
 uploads/*.wav
 uploads/*.mp3
 uploads/*.m4a
 uploads/*.flac
+uploads/*.webm
+# Catch-all ignore for uploads; keep .gitkeep
+uploads/*
 !uploads/.gitkeep
 
 # Test coverage
@@ -111,3 +114,7 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+
+
+static/fallback.mp3

@@ -461,6 +461,53 @@ main {
     box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
 }
 
+/* Live Transcription Styles */
+.message.live-transcript {
+    background: linear-gradient(135deg, #e3f2fd, #bbdefb);
+    color: #1565c0;
+    margin-left: auto;
+    text-align: right;
+    border-left: 4px solid #2196F3;
+    opacity: 0.8;
+    font-style: italic;
+    animation: pulse 2s infinite;
+    position: relative;
+}
+
+.message.live-transcript::after {
+    content: '●';
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: #2196F3;
+    animation: blink 1s infinite;
+}
+
+.message.final-transcript {
+    background: linear-gradient(135deg, #f3e5f5, #e1bee7);
+    color: #7b1fa2;
+    border-left: 4px solid #9c27b0;
+    opacity: 1;
+    font-style: normal;
+    animation: finalizeTranscript 0.5s ease-in-out;
+}
+
+@keyframes pulse {
+    0%, 100% { opacity: 0.8; }
+    50% { opacity: 0.6; }
+}
+
+@keyframes blink {
+    0%, 50% { opacity: 1; }
+    51%, 100% { opacity: 0; }
+}
+
+@keyframes finalizeTranscript {
+    0% { transform: scale(0.98); opacity: 0.8; }
+    100% { transform: scale(1); opacity: 1; }
+}
+
 /* Audio Container */
 .audio-container {
     margin-top: 20px;

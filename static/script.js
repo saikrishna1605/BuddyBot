@@ -11,8 +11,11 @@ document.addEventListener('DOMContentLoaded', function() {
     let mediaRecorder;
     let audioChunks = [];
     let isRecording = false;
-    let currentSessionId = 'session_' + Date.now();
+    // Initialize with a client-side ID, but expect it to be overwritten by the server.
+    let currentSessionId = 'session_init_' + Date.now();
     let websocket = null;
+    let currentTranscriptDiv = null;
+    let fallbackCheckInterval = null;
     
     // Chat history functions
     function saveChatHistory(sessionId, messages) {
@@ -49,12 +52,119 @@ document.addEventListener('DOMContentLoaded', function() {
         chatContainer.scrollTop = chatContainer.scrollHeight;
     }
     
+    function showLiveTranscription(text, isFinal = false, sessionId = currentSessionId) {
+        if (!currentTranscriptDiv) {
+            currentTranscriptDiv = document.createElement('div');
+            currentTranscriptDiv.className = 'message user live-transcript';
+            currentTranscriptDiv.style.cssText = `
+                background: linear-gradient(135deg, #e3f2fd, #bbdefb);
+                border-left: 4px solid #2196F3;
+                opacity: 0.8;
+                font-style: italic;
+            `;
+            chatContainer.appendChild(currentTranscriptDiv);
+        }
+        
+        currentTranscriptDiv.textContent = text;
+        
+        if (isFinal) {
+            currentTranscriptDiv.style.cssText = `
+                background: linear-gradient(135deg, #f3e5f5, #e1bee7);
+                border-left: 4px solid #9c27b0;
+                opacity: 1;
+                font-style: normal;
+            `;
+            currentTranscriptDiv.className = 'message user final-transcript';
+            // Tag the element with the session ID to prevent duplicates from the fallback
+            currentTranscriptDiv.setAttribute('data-session-id', sessionId);
+            
+            // Add to chat history
+            addMessageToHistory(sessionId, 'user', text);
+            
+            // Reset for next transcription
+            currentTranscriptDiv = null;
+        }
+        
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+    
+    function showProcessingMessage(message) {
+        // Remove any existing processing messages first
+        const existingProcessingDiv = document.querySelector('.processing');
+        if (existingProcessingDiv) {
+            existingProcessingDiv.remove();
+        }
+
+        const processingDiv = document.createElement('div');
+        processingDiv.className = 'message system processing';
+        processingDiv.textContent = message;
+        processingDiv.style.cssText = `
+            background: linear-gradient(135deg, #fff3e0, #ffe0b2);
+            color: #e65100;
+            text-align: center;
+            margin: 10px 0;
+            padding: 12px;
+            border-radius: 15px;
+            border-left: 4px solid #ff9800;
+            font-style: italic;
+            animation: pulse 2s infinite;
+        `;
+        chatContainer.appendChild(processingDiv);
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+        
+        // Remove processing message after 15 seconds
+        setTimeout(() => {
+            if (processingDiv.parentNode) {
+                processingDiv.remove();
+            }
+        }, 15000);
+    }
+    
+    async function checkForRecentTranscriptions() {
+        try {
+            const response = await fetch('/recent-transcriptions');
+            if (!response.ok) {
+                console.error('Failed to fetch recent transcriptions:', response.statusText);
+                return false;
+            }
+            const data = await response.json();
+            
+            if (data.transcriptions && data.transcriptions.length > 0) {
+                // Check if any of the recent transcriptions match our session ID
+                const foundTranscription = data.transcriptions.find(t => t.session_id === currentSessionId);
+
+                // Check if a final transcript has already been rendered for this session
+                const alreadyRendered = document.querySelector(`.final-transcript[data-session-id="${currentSessionId}"]`);
+
+                if (foundTranscription && !alreadyRendered) {
+                    console.log('📥 Fallback: Found transcription from server:', foundTranscription.text);
+                    showLiveTranscription(foundTranscription.text, true, currentSessionId);
+                    
+                    // Clear the interval since we found the transcription
+                    if (fallbackCheckInterval) {
+                        clearInterval(fallbackCheckInterval);
+                        fallbackCheckInterval = null;
+                    }
+                    
+                    // Remove processing message
+                    const processingDiv = document.querySelector('.processing');
+                    if (processingDiv) processingDiv.remove();
+                    
+                    return true;
+                }
+            }
+        } catch (error) {
+            console.error('Could not check for recent transcriptions:', error);
+        }
+        return false;
+    }
+    
     function resetConversation() {
         // Clear localStorage for current session
         localStorage.removeItem(`chatHistory_${currentSessionId}`);
         
         // Generate new session ID
-        currentSessionId = 'session_' + Date.now();
+        currentSessionId = 'session_init_' + Date.now();
         
         // Clear chat container
         chatContainer.innerHTML = '';
@@ -135,7 +245,8 @@ document.addEventListener('DOMContentLoaded', function() {
         try {
             // Establish WebSocket connection
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/ws`;
+            // Use the dedicated turn-detection endpoint to keep concerns separated
+            const wsUrl = `${protocol}//${window.location.host}/ws/turn-detection`;
             websocket = new WebSocket(wsUrl);
             
             websocket.onopen = function() {
@@ -144,63 +255,201 @@ document.addEventListener('DOMContentLoaded', function() {
             
             websocket.onmessage = function(event) {
                 console.log('Server response:', event.data);
+                
+                try {
+                    const data = JSON.parse(event.data);
+                    
+                    switch(data.type) {
+                        case 'connection_established':
+                            console.log('✅ Streaming transcription ready');
+                            // CAPTURE THE SESSION ID FROM THE SERVER
+                            if (data.session_id) {
+                                currentSessionId = data.session_id;
+                                console.log('🔑 Session ID set by server:', currentSessionId);
+                            }
+                            break;
+                            
+                        case 'transcribing':
+                            console.log('⏳ Processing audio...');
+                            showProcessingMessage(data.message);
+                            break;
+                            
+                        case 'partial_transcript':
+                            console.log('📝 Partial transcript:', data.text);
+                            showLiveTranscription(data.text, false);
+                            break;
+                            
+                        case 'final_transcript':
+                            console.log('✅ Final transcription received:', data.text);
+                            // Stop any fallback checks that might have started
+                            if (fallbackCheckInterval) {
+                                clearInterval(fallbackCheckInterval);
+                                fallbackCheckInterval = null;
+                            }
+                            showLiveTranscription(data.text, true);
+                            break;
+                        
+                        case 'turn_end':
+                            console.log('🛑 Turn ended by server.');
+                            // Optionally show a subtle UI cue that turn has ended
+                            // Close WebSocket after a short delay to finish any server cleanup
+                            setTimeout(() => {
+                                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                                    websocket.close(1000, 'Turn ended');
+                                }
+                            }, 300);
+                            break;
+                            
+                        case 'transcription_error':
+                            console.error('❌ Transcription error:', data.message);
+                            showError('Transcription error: ' + data.message);
+                            break;
+                            
+                        case 'audio_received':
+                            // This can be noisy, so we can comment it out if not needed for debugging
+                            // console.log(`📊 Audio chunk received: ${data.bytes} bytes`);
+                            break;
+                            
+                        case 'error':
+                            console.error('❌ WebSocket error:', data.message);
+                            showError(data.message);
+                            break;
+                            
+                        default:
+                            console.log('Unknown message type:', data.type);
+                    }
+                } catch (e) {
+                    // Handle non-JSON messages
+                    console.log('Non-JSON message:', event.data);
+                }
             };
             
+            websocket.onclose = function(event) {
+                console.log('WebSocket connection closed:', event.code, event.reason || '');
+                // Stop polling if server closed cleanly
+                if (fallbackCheckInterval) {
+                    clearInterval(fallbackCheckInterval);
+                    fallbackCheckInterval = null;
+                }
+                
+                // If no final transcript exists, start fallback polling
+                const alreadyRendered = document.querySelector(`.final-transcript[data-session-id="${currentSessionId}"]`);
+                if (!alreadyRendered) {
+                    console.log('🔄 No final transcript found. Starting fallback check...');
+                    let checkCount = 0;
+                    const maxChecks = 10; // 10 checks * 2 seconds = 20 seconds timeout
+
+                    fallbackCheckInterval = setInterval(async () => {
+                        checkCount++;
+                        const found = await checkForRecentTranscriptions();
+                        if (found || checkCount >= maxChecks) {
+                            clearInterval(fallbackCheckInterval);
+                            fallbackCheckInterval = null;
+                            if (!found) {
+                                console.log('Fallback check timed out.');
+                                const processingDiv = document.querySelector('.processing');
+                                if (processingDiv) processingDiv.remove();
+                                showError("Could not retrieve transcription. Please try again.");
+                            }
+                        }
+                    }, 2000);
+                }
+            };
+
             websocket.onerror = function(error) {
-                console.error('WebSocket error:', error);
-                showError('WebSocket connection error');
+                console.error('WebSocket error event:', error);
+                showError('A connection error occurred. Please try again.');
             };
-            
-            websocket.onclose = function() {
-                console.log('WebSocket connection closed');
-            };
-            
-            // Request microphone access
+
+            // Get microphone access (we'll stream raw PCM 16k mono to server)
             const stream = await navigator.mediaDevices.getUserMedia({ 
                 audio: {
                     echoCancellation: true,
                     noiseSuppression: true,
-                    sampleRate: 44100
+                    channelCount: 1
                 }
             });
-            
-            mediaRecorder = new MediaRecorder(stream, {
-                mimeType: 'audio/webm;codecs=opus'
-            });
+
+            // Fallback MediaRecorder (used only if we need to upload a blob later)
+            mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
             audioChunks = [];
-            
-            mediaRecorder.ondataavailable = (event) => {
-                if (event.data.size > 0 && websocket && websocket.readyState === WebSocket.OPEN) {
-                    // Stream audio chunk to server via WebSocket
-                    const reader = new FileReader();
-                    reader.onload = function() {
-                        websocket.send(reader.result);
-                        console.log(`Sent audio chunk: ${event.data.size} bytes`);
-                    };
-                    reader.readAsArrayBuffer(event.data);
+            mediaRecorder.ondataavailable = event => { if (event.data.size > 0) audioChunks.push(event.data); };
+
+            // Live PCM streaming pipeline using Web Audio API
+            const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            const source = audioContext.createMediaStreamSource(stream);
+            const processor = audioContext.createScriptProcessor(4096, 1, 1);
+
+            processor.onaudioprocess = (e) => {
+                if (!(websocket && websocket.readyState === WebSocket.OPEN)) return;
+                const input = e.inputBuffer.getChannelData(0); // Float32 [-1,1]
+                const pcm16 = new Int16Array(input.length);
+                for (let i = 0; i < input.length; i++) {
+                    let s = Math.max(-1, Math.min(1, input[i]));
+                    pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
                 }
+                websocket.send(pcm16.buffer);
+            };
+
+            source.connect(processor);
+            processor.connect(audioContext.destination);
+
+            mediaRecorder.onstart = () => {
+                console.log('Recording started');
+                isRecording = true;
+                recordBtn.classList.add('recording');
+                const recordText = recordBtn.querySelector('.record-text');
+                if (recordText) recordText.textContent = 'Stop Recording';
+                recordingIndicator.classList.remove('hidden');
             };
             
             mediaRecorder.onstop = async () => {
-                stream.getTracks().forEach(track => track.stop());
+                console.log('Recording stopped, waiting for transcription...');
+                isRecording = false;
+                recordBtn.classList.remove('recording');
+                const recordText = recordBtn.querySelector('.record-text');
+                if (recordText) recordText.textContent = 'Start Recording';
+                recordingIndicator.classList.add('hidden');
                 
-                // Close WebSocket connection when recording stops
-                if (websocket) {
-                    websocket.close();
+                // Send a "stop_streaming" message to the server
+                if (websocket && websocket.readyState === WebSocket.OPEN) {
+                    console.log('Sending stop_streaming message');
+                    websocket.send("stop_streaming");
                 }
                 
-                console.log('Recording stopped and WebSocket closed');
+                // Start fallback timer: if no final transcript via WS within 3s, upload chunks
+                const fallbackTimer = setTimeout(async () => {
+                    // Cancel WS polling if we switch to upload fallback
+                    if (fallbackCheckInterval) {
+                        clearInterval(fallbackCheckInterval);
+                        fallbackCheckInterval = null;
+                    }
+                    
+                    const alreadyRendered = document.querySelector(`.final-transcript[data-session-id="${currentSessionId}"]`);
+                    if (!alreadyRendered && audioChunks.length > 0) {
+                        console.log('⛑️ Streaming fallback: uploading recorded audio to /agent/chat');
+                        const completeBlob = new Blob(audioChunks, { type: 'audio/webm;codecs=opus' });
+                        try {
+                            await processAudio(completeBlob);
+                        } catch (e) {
+                            console.error('Fallback upload failed:', e);
+                        }
+                    }
+                }, 3000);
+                
+                // Stop the microphone track
+                const tracks = mediaRecorder.stream.getTracks();
+                tracks.forEach(track => track.stop());
+                
+                // Finalize any pending transcription
+                if (currentTranscriptDiv) {
+                    currentTranscriptDiv.style.opacity = '1';
+                    currentTranscriptDiv = null;
+                }
             };
             
-            // Start recording and request data every 1000ms (1 second intervals)
+            // Start the fallback recorder to keep chunks for upload if needed
             mediaRecorder.start(1000);
-            isRecording = true;
-            
-            // Update UI
-            recordBtn.classList.add('recording');
-            const recordText = recordBtn.querySelector('.record-text');
-            if (recordText) recordText.textContent = 'Stop Recording';
-            recordingIndicator.classList.remove('hidden');
             
         } catch (error) {
             console.error('Recording error:', error);
@@ -221,9 +470,15 @@ document.addEventListener('DOMContentLoaded', function() {
             mediaRecorder.stop();
         }
         
-        // Close WebSocket if still open
+        // Send stop streaming message to server
         if (websocket && websocket.readyState === WebSocket.OPEN) {
-            websocket.close();
+            websocket.send('stop_streaming');
+            // Wait for server to close, but force close after 1s as safety
+            setTimeout(() => {
+                if (websocket.readyState === WebSocket.OPEN) {
+                    websocket.close(1000, 'Client stop');
+                }
+            }, 1000);
         }
         
         isRecording = false;
@@ -231,6 +486,12 @@ document.addEventListener('DOMContentLoaded', function() {
         const recordText = recordBtn.querySelector('.record-text');
         if (recordText) recordText.textContent = 'Start Recording';
         recordingIndicator.classList.add('hidden');
+        
+        // Finalize any pending transcription
+        if (currentTranscriptDiv) {
+            currentTranscriptDiv.style.opacity = '1';
+            currentTranscriptDiv = null;
+        }
     }
     
     async function processAudio(audioBlob) {
@@ -238,7 +499,8 @@ document.addEventListener('DOMContentLoaded', function() {
         
         try {
             const formData = new FormData();
-            formData.append('file', audioBlob, 'recording.wav');
+            // The fallback blob is webm/opus; use a matching filename
+            formData.append('file', audioBlob, 'recording.webm');
             
             const response = await fetch(`/agent/chat/${currentSessionId}`, {
                 method: 'POST',
@@ -275,4 +537,104 @@ document.addEventListener('DOMContentLoaded', function() {
             if (processingIndicator) processingIndicator.classList.add('hidden');
         }
     }
+    
+    // =============================
+    // Separate Quick Transcribe UI
+    // =============================
+    (function initQuickTranscribe() {
+        const startBtn = document.getElementById('transcribeStartBtn');
+        const stopBtn = document.getElementById('transcribeStopBtn');
+        const clearBtn = document.getElementById('transcribeClearBtn');
+        const fileInput = document.getElementById('transcribeFileInput');
+        const uploadBtn = document.getElementById('transcribeUploadBtn');
+        const labels = document.getElementById('transcribeLabels');
+        const status = document.getElementById('transcribeStatus');
+
+        if (!startBtn || !stopBtn || !clearBtn || !fileInput || !uploadBtn || !labels) return;
+
+        let rec;
+        let recChunks = [];
+        let recStream;
+
+        function addLabel(text, variant = 'you') {
+            const label = document.createElement('div');
+            label.style.padding = '10px 12px';
+            label.style.borderRadius = '12px';
+            label.style.background = variant === 'you' ? '#e3f2fd' : '#ede7f6';
+            label.style.borderLeft = variant === 'you' ? '4px solid #2196F3' : '4px solid #673AB7';
+            label.style.color = '#222';
+            label.style.fontSize = '14px';
+            label.textContent = text;
+            labels.appendChild(label);
+        }
+
+        function setStatus(msg) {
+            if (status) status.textContent = msg || '';
+        }
+
+        async function transcribeBlob(blob) {
+            setStatus('Uploading for transcription...');
+            const fd = new FormData();
+            fd.append('file', blob, 'quick-recording.webm');
+            const res = await fetch('/transcribe/file', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (res.ok && data.status === 'success') {
+                // Display as sequential labels: split sentences roughly
+                const parts = String(data.transcription || '').split(/(?<=[.!?])\s+/).filter(Boolean);
+                if (!parts.length) addLabel('(no speech detected)', 'ai');
+                parts.forEach((p, i) => {
+                    setTimeout(() => addLabel(p.trim(), 'you'), i * 250);
+                });
+                setStatus('Transcription complete.');
+            } else {
+                addLabel('Transcription failed.', 'ai');
+                setStatus(data.detail || data.message || 'Failed.');
+            }
+        }
+
+        startBtn.addEventListener('click', async () => {
+            try {
+                recStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                rec = new MediaRecorder(recStream, { mimeType: 'audio/webm;codecs=opus' });
+                recChunks = [];
+                rec.ondataavailable = e => { if (e.data.size) recChunks.push(e.data); };
+                rec.onstart = () => {
+                    setStatus('Recording...');
+                    startBtn.disabled = true; stopBtn.disabled = false;
+                };
+                rec.onstop = async () => {
+                    setStatus('Finalizing recording...');
+                    const blob = new Blob(recChunks, { type: 'audio/webm;codecs=opus' });
+                    // Show a placeholder label to mimic progressive feel
+                    addLabel('Processing your audio...', 'ai');
+                    await transcribeBlob(blob);
+                    startBtn.disabled = false; stopBtn.disabled = true;
+                    if (recStream) recStream.getTracks().forEach(t => t.stop());
+                };
+                rec.start(1000);
+            } catch (e) {
+                setStatus('Mic error: ' + (e.message || e));
+            }
+        });
+
+        stopBtn.addEventListener('click', () => {
+            try { if (rec && rec.state !== 'inactive') rec.stop(); } catch {}
+        });
+
+        clearBtn.addEventListener('click', () => {
+            labels.innerHTML = '';
+            setStatus('');
+        });
+
+        uploadBtn.addEventListener('click', async () => {
+            const file = fileInput.files && fileInput.files[0];
+            if (!file) { setStatus('Choose an audio file first.'); return; }
+            try {
+                addLabel('Processing selected file...', 'ai');
+                await transcribeBlob(file);
+            } catch (e) {
+                setStatus('Upload error: ' + (e.message || e));
+            }
+        });
+    })();
 });
