@@ -1,9 +1,13 @@
 import asyncio
 import json
 import logging
+import os
 from datetime import datetime
 from typing import Optional, Callable
 import threading
+import contextlib
+
+import websockets
 
 import google.generativeai as genai
 
@@ -19,6 +23,8 @@ from assemblyai.streaming.v3 import (
 )
 
 logger = logging.getLogger(__name__)
+MURF_WS_URL = "wss://api.murf.ai/v1/speech/stream-input"
+MURF_KEY = os.getenv("MURF_API_KEY")
 
 class TurnDetectionService:
     """Encapsulates AssemblyAI Universal Streaming turn detection."""
@@ -133,8 +139,64 @@ class TurnDetectionService:
         session_id = f"turn_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         loop = asyncio.get_running_loop()
         send_queue: asyncio.Queue = asyncio.Queue()
+        # Murf streaming queue to forward LLM chunks to TTS
+        murf_queue: asyncio.Queue = asyncio.Queue()
+        murf_task: Optional[asyncio.Task] = None
 
         client = self.create_client()
+
+        async def murf_ws_worker(static_ctx: str):
+            """Open a Murf WS, forward text chunks from murf_queue, and print base64 audio."""
+            if not MURF_KEY:
+                logger.warning("[TurnDetection] MURF_API_KEY missing; skipping Murf WS TTS")
+                return
+            qs = f"?api-key={MURF_KEY.strip('\"\'')}\u0026sample_rate=44100\u0026channel_type=MONO\u0026format=WAV"
+            url = f"{MURF_WS_URL}{qs}"
+            try:
+                async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=10) as ws:
+                    voice_cfg = {
+                        "voice_config": {
+                            "voiceId": "en-US-amara",
+                            "style": "Conversational",
+                            "rate": 0,
+                            "pitch": 0,
+                            "variation": 1,
+                        }
+                    }
+                    await ws.send(json.dumps(voice_cfg))
+
+                    async def receiver():
+                        print("\n--- Murf WS audio stream (base64) ---")
+                        try:
+                            while True:
+                                raw = await ws.recv()
+                                try:
+                                    data = json.loads(raw)
+                                except Exception:
+                                    logger.debug(f"[TurnDetection] Murf WS non-JSON: {raw}")
+                                    continue
+                                if isinstance(data, dict):
+                                    if "audio" in data:
+                                        print(data["audio"])  # base64
+                                    if data.get("final"):
+                                        break
+                        finally:
+                            print("--- Murf WS audio stream end ---\n")
+
+                    recv_task = asyncio.create_task(receiver())
+                    # Sender loop: forward chunks
+                    while True:
+                        item = await murf_queue.get()
+                        if isinstance(item, dict) and item.get("end"):
+                            await ws.send(json.dumps({"context_id": static_ctx, "end": True}))
+                            break
+                        if isinstance(item, dict) and "text" in item:
+                            await ws.send(json.dumps({"context_id": static_ctx, "text": item["text"]}))
+                    # Wait for receiver to finish after final
+                    with contextlib.suppress(Exception):
+                        await recv_task
+            except Exception as e:
+                logger.warning(f"[TurnDetection] Murf WS worker error: {e}")
 
         def stream_llm_response(text: str) -> None:
             try:
@@ -154,6 +216,11 @@ class TurnDetectionService:
                     if part:
                         print(part, end='', flush=True)
                         chunks.append(part)
+                        # Forward this chunk to Murf WS via the async queue
+                        try:
+                            asyncio.run_coroutine_threadsafe(murf_queue.put({"text": part}), loop)
+                        except Exception as fe:
+                            logger.debug(f"[TurnDetection] could not enqueue Murf text: {fe}")
                 print("\n=== End of LLM stream ===\n")
                 try:
                     stream.resolve()
@@ -161,11 +228,21 @@ class TurnDetectionService:
                     pass
                 full_text = ''.join(chunks).strip()
                 logger.info("[TurnDetection] LLM streamed response length: %d", len(full_text))
+                # Signal end to Murf so it can finalize
+                try:
+                    asyncio.run_coroutine_threadsafe(murf_queue.put({"end": True}), loop)
+                except Exception:
+                    pass
             except Exception as e:
                 logger.exception(f"[TurnDetection] LLM streaming error: {e}")
 
         def on_final(text: str):
-            # Launch streaming in a background thread to avoid blocking event loop / handlers
+            # Start Murf worker with a static context_id to avoid context limit issues
+            nonlocal murf_task
+            static_ctx = f"{session_id}_ctx"
+            if not murf_task or murf_task.done():
+                murf_task = asyncio.create_task(murf_ws_worker(static_ctx))
+            # Launch LLM streaming in a background thread; chunks will be forwarded to Murf
             threading.Thread(target=stream_llm_response, args=(text,), daemon=True).start()
 
         self.wire_handlers(client, loop, session_id, send_queue, on_final)
@@ -215,6 +292,11 @@ class TurnDetectionService:
                 client.disconnect(terminate=True)
             except Exception:
                 pass
+            # Close Murf worker if still running
+            if murf_task and not murf_task.done():
+                murf_task.cancel()
+                with contextlib.suppress(Exception):
+                    await murf_task
             try:
                 await websocket.close()
             except Exception:

@@ -8,7 +8,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Callable
 from pathlib import Path
 import tempfile
 import requests
@@ -16,8 +16,11 @@ import os
 import json
 import logging
 import asyncio
+import contextlib
 import httpx
 import assemblyai as aai
+import websockets
+import base64
 from assemblyai.streaming.v3 import (
     BeginEvent,
     StreamingClient,
@@ -69,6 +72,7 @@ LLM_TIMEOUT = 30
 TTS_TIMEOUT = 30
 MAX_LLM_RESPONSE_LENGTH = 2000
 MURF_API_URL = "https://api.murf.ai/v1/speech/generate"
+MURF_WS_URL = "wss://api.murf.ai/v1/speech/stream-input"
 
 # ===== DATA MODELS =====
 class ChatMessage(BaseModel):
@@ -287,6 +291,212 @@ async def stream_llm_response(text: str, chat_history: List[ChatMessage] = None)
 
     # Run blocking streaming in a thread so we don't block the event loop
     return await asyncio.to_thread(_run_streaming)
+
+async def stream_tts_via_murf_ws(text: str, *, voice_id: str = "en-US-amara", sample_rate: int = 44100, channel_type: str = "MONO", fmt: str = "WAV", context_id: Optional[str] = None) -> None:
+    """Send text to Murf WebSocket TTS and print base64 audio chunks to console.
+
+    This uses Murf's WebSocket API so we can stream LLM output and receive base64-encoded audio.
+
+    If context_id is provided, it will be included in the messages to reuse a single context.
+    """
+    if not MURF_KEY:
+        logger.warning("MURF_API_KEY missing - cannot stream TTS via Murf WebSocket")
+        return
+
+    if not text:
+        logger.info("No text provided to TTS stream")
+        return
+
+    # Build connection URL with query params
+    qs = f"?api-key={MURF_KEY.strip('\"\'')}\u0026sample_rate={sample_rate}\u0026channel_type={channel_type}\u0026format={fmt}"
+    ws_url = f"{MURF_WS_URL}{qs}"
+
+    try:
+        async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20, close_timeout=10) as ws:
+            # Optional voice config first
+            voice_cfg: Dict[str, Any] = {
+                "voice_config": {
+                    "voiceId": voice_id,
+                    "style": "Conversational",
+                    "rate": 0,
+                    "pitch": 0,
+                    "variation": 1,
+                }
+            }
+            await ws.send(json.dumps(voice_cfg))
+
+            # Send text to synthesize; include context_id (static if provided)
+            text_msg: Dict[str, Any] = {
+                "text": text,
+                # Close the turn so Murf starts and completes synthesis
+                "end": True,
+            }
+            if context_id:
+                text_msg["context_id"] = context_id
+            await ws.send(json.dumps(text_msg))
+
+            print("\n--- Murf WS audio stream (base64) ---")
+            first_chunk = True
+            while True:
+                try:
+                    raw = await ws.recv()
+                    data = json.loads(raw)
+                except Exception as e:
+                    logger.error(f"Error receiving Murf WS data: {e}")
+                    break
+
+                # Print any errors/status for visibility
+                if isinstance(data, dict):
+                    if "audio" in data:
+                        b64_audio: str = data["audio"]
+                        # Print the base64 string; per docs this includes WAV header in first chunk
+                        print(b64_audio)
+                        # Optionally, we could decode and handle the header here; requirement is to print base64
+                    if data.get("final"):
+                        # Murf indicates synthesis is done for this context
+                        break
+                else:
+                    logger.debug(f"Non-dict message from Murf WS: {data}")
+
+            print("--- Murf WS audio stream end ---\n")
+    except Exception as e:
+        logger.error(f"Murf WebSocket TTS error: {e}")
+
+
+class MurfWsClient:
+    """Thin Murf WebSocket TTS client for streaming text chunks and printing audio base64."""
+
+    def __init__(self, *, api_key: str, sample_rate: int = 44100, channel_type: str = "MONO", fmt: str = "WAV", voice_id: str = "en-US-amara", context_id: Optional[str] = None):
+        self.api_key = api_key.strip('\"\'')
+        self.sample_rate = sample_rate
+        self.channel_type = channel_type
+        self.fmt = fmt
+        self.voice_id = voice_id
+        self.context_id = context_id
+        self._ws: Optional[websockets.WebSocketClientProtocol] = None
+        self._recv_task: Optional[asyncio.Task] = None
+        self._closed = False
+
+    async def connect(self):
+        qs = f"?api-key={self.api_key}\u0026sample_rate={self.sample_rate}\u0026channel_type={self.channel_type}\u0026format={self.fmt}"
+        ws_url = f"{MURF_WS_URL}{qs}"
+        self._ws = await websockets.connect(ws_url, ping_interval=20, ping_timeout=20, close_timeout=10)
+        # Send voice config
+        voice_cfg: Dict[str, Any] = {
+            "voice_config": {
+                "voiceId": self.voice_id,
+                "style": "Conversational",
+                "rate": 0,
+                "pitch": 0,
+                "variation": 1,
+            }
+        }
+        await self._ws.send(json.dumps(voice_cfg))
+        # Start receiver
+        self._recv_task = asyncio.create_task(self._receiver_loop())
+
+    async def _receiver_loop(self):
+        print("\n--- Murf WS audio stream (base64) ---")
+        try:
+            while True:
+                msg = await self._ws.recv()
+                try:
+                    data = json.loads(msg)
+                except Exception:
+                    logger.debug(f"Murf WS non-JSON: {msg}")
+                    continue
+                if isinstance(data, dict):
+                    if "audio" in data:
+                        print(data["audio"])  # Requirement: print base64 encoded audio
+                    if data.get("final"):
+                        # Murf indicates synthesis for current context is complete
+                        break
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.warning(f"Murf WS receiver ended: {e}")
+        finally:
+            print("--- Murf WS audio stream end ---\n")
+
+    async def send_text(self, text: str, *, end: bool = False, clear: bool = False):
+        if not self._ws:
+            raise RuntimeError("Murf WS not connected")
+        payload: Dict[str, Any] = {"text": text}
+        if self.context_id:
+            payload["context_id"] = self.context_id
+        if end:
+            payload["end"] = True
+        if clear:
+            payload["clear"] = True
+        await self._ws.send(json.dumps(payload))
+
+    async def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if self._recv_task and not self._recv_task.done():
+                self._recv_task.cancel()
+                with contextlib.suppress(Exception):
+                    await self._recv_task
+        finally:
+            if self._ws:
+                with contextlib.suppress(Exception):
+                    await self._ws.close()
+
+
+async def relay_llm_stream_to_murf(user_text: str, chat_history: Optional[List[ChatMessage]], *, murf_client: MurfWsClient) -> str:
+    """Stream Gemini LLM response chunks and forward them to Murf over WS.
+
+    Prints LLM chunks to console (as before) and Murf will print base64 audio via its receiver loop.
+    Returns the accumulated LLM text.
+    """
+    if not GEMINI_API_KEY:
+        return ""
+
+    # Build prompt with history
+    if chat_history:
+        context = "You are a helpful assistant. Answer clearly and conversationally.\n\nConversation history (most recent first):\n"
+        recent_history = chat_history[-10:] if len(chat_history) > 10 else chat_history
+        for msg in recent_history:
+            context += f"{msg.role.title()}: {msg.content}\n"
+        context += f"\nUser just said: \"{user_text}\"\nRespond directly to the user.\n"
+    else:
+        context = f"You are a helpful assistant. Answer clearly and concisely.\nUser said: \"{user_text}\"\nRespond directly to the user."
+
+    loop = asyncio.get_running_loop()
+    full_parts: list[str] = []
+
+    def _run_and_forward():
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            stream = model.generate_content(context, stream=True)
+            print("\n--- LLM streaming start ---")
+            for chunk in stream:
+                try:
+                    part = getattr(chunk, 'text', '') or ''
+                except Exception:
+                    part = ''
+                if part:
+                    print(part, end='', flush=True)
+                    full_parts.append(part)
+                    # forward to Murf on the event loop (not blocking this thread)
+                    loop.call_soon_threadsafe(lambda p=part: asyncio.create_task(murf_client.send_text(p)))
+            print("\n--- LLM streaming end ---\n")
+            try:
+                stream.resolve()
+            except Exception:
+                pass
+        except Exception as e:
+            logger.error(f"Error during LLM streaming relay: {e}")
+
+    # Run blocking Gemini stream in a thread
+    await asyncio.to_thread(_run_and_forward)
+    # Mark end of the context/turn so Murf can finalize
+    with contextlib.suppress(Exception):
+        await murf_client.send_text("", end=True)
+
+    return ''.join(full_parts).strip()
 
 async def generate_speech(text: str, voice_id: str = "en-US-natalie") -> tuple[Optional[str], str]:
     """Generate speech using Murf AI"""
@@ -602,6 +812,20 @@ async def streaming_ws(websocket: WebSocket):
                             except Exception:
                                 pass
                             logger.info("Streaming LLM response completed (length: %d)", len(llm_text))
+
+                            # Send the LLM response to Murf via WebSocket and print base64 audio
+                            try:
+                                static_context_id = f"{session_id}_ctx"  # reuse to avoid context limits per instructions
+                                await stream_tts_via_murf_ws(
+                                    llm_text,
+                                    voice_id="en-US-amara",
+                                    sample_rate=44100,
+                                    channel_type="MONO",
+                                    fmt="WAV",
+                                    context_id=static_context_id,
+                                )
+                            except Exception as e:
+                                logger.warning(f"Skipping Murf WS TTS due to error: {e}")
                         else:
                             logger.warning("Streaming LLM response returned empty text")
 
@@ -783,14 +1007,30 @@ async def transcribe_file(file: UploadFile = File(...)):
     transcription, status = await transcribe_audio(file.file)
 
     if status == "success":
-        # After quick transcription, trigger LLM streaming and print to console.
+        # After quick transcription, stream LLM to Murf via WebSocket and print base64 audio.
         try:
-            logger.info("Triggering LLM streaming for /transcribe/file transcription...")
-            # No chat history for quick mode
-            await stream_llm_response(transcription)
+            logger.info("Triggering LLM -> Murf WS streaming for /transcribe/file transcription...")
+            static_context_id = "file_ctx"
+            murf_client = MurfWsClient(
+                api_key=MURF_KEY or "",
+                sample_rate=44100,
+                channel_type="MONO",
+                fmt="WAV",
+                voice_id="en-US-amara",
+                context_id=static_context_id,
+            )
+            await murf_client.connect()
+            # Relay streaming LLM chunks to Murf, printing audio base64 to console
+            llm_text = await relay_llm_stream_to_murf(transcription, None, murf_client=murf_client)
+            await murf_client.close()
+            # Additionally generate an HTTP TTS URL for convenience
+            audio_url, tts_status = await generate_speech(llm_text or "")
+            if tts_status == "success" and audio_url:
+                logger.info("Murf HTTP TTS audio URL: %s", audio_url)
+                return {"transcription": transcription, "llm_response": llm_text, "audio_url": audio_url, "status": "success"}
         except Exception as e:
             # Do not fail the endpoint if streaming has issues
-            logger.warning(f"LLM streaming skipped due to error: {e}")
+            logger.warning(f"LLM->Murf WS streaming skipped due to error: {e}")
         return {"transcription": transcription, "status": "success"}
     else:
         raise HTTPException(status_code=500, detail=f"Transcription failed: {status}")
