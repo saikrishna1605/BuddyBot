@@ -3,6 +3,9 @@ import json
 import logging
 from datetime import datetime
 from typing import Optional, Callable
+import threading
+
+import google.generativeai as genai
 
 from assemblyai.streaming.v3 import (
     BeginEvent,
@@ -133,9 +136,37 @@ class TurnDetectionService:
 
         client = self.create_client()
 
+        def stream_llm_response(text: str) -> None:
+            try:
+                if not text or not text.strip():
+                    return
+                prompt = (
+                    "You are a helpful assistant. Answer the user's request clearly, concisely, and conversationally.\n"
+                    f"User said: \"{text}\"\nRespond directly to the user."
+                )
+                logger.info("[TurnDetection] LLM streaming input text: %s", text[:300])
+                model = genai.GenerativeModel('gemini-1.5-flash')
+                stream = model.generate_content(prompt, stream=True)
+                chunks = []
+                print("\n=== Streaming LLM response (Gemini) ===")
+                for chunk in stream:
+                    part = getattr(chunk, 'text', '') or ''
+                    if part:
+                        print(part, end='', flush=True)
+                        chunks.append(part)
+                print("\n=== End of LLM stream ===\n")
+                try:
+                    stream.resolve()
+                except Exception:
+                    pass
+                full_text = ''.join(chunks).strip()
+                logger.info("[TurnDetection] LLM streamed response length: %d", len(full_text))
+            except Exception as e:
+                logger.exception(f"[TurnDetection] LLM streaming error: {e}")
+
         def on_final(text: str):
-            # hook for saving history, etc. For demo, we do nothing here.
-            pass
+            # Launch streaming in a background thread to avoid blocking event loop / handlers
+            threading.Thread(target=stream_llm_response, args=(text,), daemon=True).start()
 
         self.wire_handlers(client, loop, session_id, send_queue, on_final)
         self.connect(client)

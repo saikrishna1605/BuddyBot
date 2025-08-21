@@ -10,6 +10,8 @@
           "backdrop-filter"
         ]
       }
-    ]
+    ],
+    "axe/forms": "off",
+    "no-inline-styles": "off"
   }
 }

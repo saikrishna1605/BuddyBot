@@ -241,6 +241,53 @@ async def generate_llm_response(text: str, chat_history: List[ChatMessage] = Non
     except Exception as e:
         return "I'm having trouble processing your request right now.", f"LLM error: {str(e)}"
 
+async def stream_llm_response(text: str, chat_history: List[ChatMessage] = None) -> str:
+    """Stream LLM response using Google Gemini and print chunks to console.
+
+    Returns the accumulated response text (may be empty on failure).
+    """
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY missing - cannot stream LLM response")
+        return ""
+
+    # Build a clear, focused prompt centered on the transcript
+    if chat_history:
+        context = "You are a helpful assistant. Answer the user's request clearly, concisely, and conversationally.\n\nConversation history (most recent first):\n"
+        recent_history = chat_history[-10:] if len(chat_history) > 10 else chat_history
+        for message in recent_history:
+            context += f"{message.role.title()}: {message.content}\n"
+        context += f"\nUser just said: \"{text}\"\nRespond directly to the user.\n"
+    else:
+        context = f"You are a helpful assistant. Answer clearly and concisely.\nUser said: \"{text}\"\nRespond directly to the user."
+
+    def _run_streaming() -> str:
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            stream = model.generate_content(context, stream=True)
+            full: list[str] = []
+            print("\n--- LLM streaming start ---")
+            for chunk in stream:
+                try:
+                    part = getattr(chunk, 'text', '') or ''
+                except Exception:
+                    part = ''
+                if part:
+                    print(part, end='', flush=True)
+                    full.append(part)
+            print("\n--- LLM streaming end ---\n")
+            # Resolve to ensure full response is available if needed later
+            try:
+                stream.resolve()
+            except Exception:
+                pass
+            return ''.join(full).strip()
+        except Exception as e:
+            logger.error(f"Streaming LLM error: {e}")
+            return ""
+
+    # Run blocking streaming in a thread so we don't block the event loop
+    return await asyncio.to_thread(_run_streaming)
+
 async def generate_speech(text: str, voice_id: str = "en-US-natalie") -> tuple[Optional[str], str]:
     """Generate speech using Murf AI"""
     try:
@@ -537,7 +584,28 @@ async def streaming_ws(websocket: WebSocket):
                     
                     # If this is a final transcript, we can break the loop
                     if message.get('type') == 'final_transcript':
-                        logger.info("Final transcript sent, ending message handler")
+                        logger.info("Final transcript sent; starting streaming LLM response...")
+                        logger.info("LLM streaming input text: %s", message.get('text', '')[:300])
+                        # Add to chat history for this streaming session
+                        try:
+                            chat_manager.add_message(session_id, "user", message.get('text', ''))
+                            chat_history = chat_manager.get_history(session_id)
+                        except Exception:
+                            chat_history = None
+
+                        # Stream LLM response and print to console
+                        llm_text = await stream_llm_response(message.get('text', ''), chat_history)
+                        if llm_text:
+                            # Save assistant message for history continuity
+                            try:
+                                chat_manager.add_message(session_id, "assistant", llm_text)
+                            except Exception:
+                                pass
+                            logger.info("Streaming LLM response completed (length: %d)", len(llm_text))
+                        else:
+                            logger.warning("Streaming LLM response returned empty text")
+
+                        logger.info("Ending message handler after LLM streaming")
                         break
                         
                 except asyncio.TimeoutError:
@@ -691,15 +759,38 @@ async def get_recent_transcriptions():
 @app.post("/transcribe/file")
 async def transcribe_file(file: UploadFile = File(...)):
     """Transcribe audio file to text"""
-    if not file.filename or not file.size:
+    if not file or not file.filename:
         raise HTTPException(status_code=400, detail="Invalid audio file")
-    
-    if file.size > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail="File too large (max 50MB)")
-    
+
+    # Safely determine file size from the underlying file object
+    size_bytes = None
+    try:
+        current_pos = file.file.tell()
+        file.file.seek(0, 2)  # Seek to end
+        size_bytes = file.file.tell()
+        file.file.seek(0)  # Reset to beginning for downstream consumers
+        logger.info(f"/transcribe/file received: {file.filename} ({size_bytes} bytes)")
+    except Exception as e:
+        logger.warning(f"Could not determine uploaded file size: {e}")
+        try:
+            file.file.seek(0)
+        except Exception:
+            pass
+
+    if size_bytes is not None and size_bytes > MAX_FILE_SIZE:
+        raise HTTPException(status_code=413, detail="File too large (max 10MB)")
+
     transcription, status = await transcribe_audio(file.file)
-    
+
     if status == "success":
+        # After quick transcription, trigger LLM streaming and print to console.
+        try:
+            logger.info("Triggering LLM streaming for /transcribe/file transcription...")
+            # No chat history for quick mode
+            await stream_llm_response(transcription)
+        except Exception as e:
+            # Do not fail the endpoint if streaming has issues
+            logger.warning(f"LLM streaming skipped due to error: {e}")
         return {"transcription": transcription, "status": "success"}
     else:
         raise HTTPException(status_code=500, detail=f"Transcription failed: {status}")
