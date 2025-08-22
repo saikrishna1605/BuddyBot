@@ -16,6 +16,31 @@ document.addEventListener('DOMContentLoaded', function() {
     let websocket = null;
     let currentTranscriptDiv = null;
     let fallbackCheckInterval = null;
+    // For Day 21: accumulate streamed base64 audio chunks from server
+    let audioBase64Chunks = [];
+    // Minimal streaming acknowledgement flags
+    // Log once per streaming session
+    let streamAnnounced = false;
+    // UI handles for streaming panel
+    const audioStreamCard = document.getElementById('audioStreamCard');
+    const streamStatus = document.getElementById('streamStatus');
+    const streamChunkCount = document.getElementById('streamChunkCount');
+    const streamTotalChars = document.getElementById('streamTotalChars');
+    const streamChunksList = document.getElementById('streamChunksList');
+
+    function setStreamVisible(visible) {
+        if (!audioStreamCard) return;
+        audioStreamCard.classList.toggle('hidden', !visible);
+    }
+
+    function setStreamStatus(state) {
+        if (!streamStatus) return;
+        streamStatus.textContent = state;
+        streamStatus.classList.remove('pill-waiting', 'pill-active', 'pill-done');
+        if (state === 'Streaming') streamStatus.classList.add('pill-active');
+        else if (state === 'Completed') streamStatus.classList.add('pill-done');
+        else streamStatus.classList.add('pill-waiting');
+    }
     
     // Chat history functions
     function saveChatHistory(sessionId, messages) {
@@ -268,6 +293,20 @@ document.addEventListener('DOMContentLoaded', function() {
                                 console.log('🔑 Session ID set by server:', currentSessionId);
                             }
                             break;
+                        case 'audio_chunk':
+                            // Accumulate base64 chunks and log acknowledgement
+                            if (typeof data.data === 'string' && data.data.length) {
+                                audioBase64Chunks.push(data.data);
+                                console.log(`🎧 Audio chunk received (${audioBase64Chunks.length})`);
+                            }
+                            break;
+                        case 'audio_stream_end':
+                            // Log final acknowledgement and size; do not auto-play
+                            const totalChars1 = audioBase64Chunks.reduce((acc, s) => acc + s.length, 0);
+                            console.log(`✅ Audio stream complete. Chunks: ${audioBase64Chunks.length}, total base64 chars: ${totalChars1}`);
+                            // Reset for next turn
+                            audioBase64Chunks = [];
+                            break;
                             
                         case 'transcribing':
                             console.log('⏳ Processing audio...');
@@ -277,6 +316,41 @@ document.addEventListener('DOMContentLoaded', function() {
                         case 'partial_transcript':
                             console.log('📝 Partial transcript:', data.text);
                             showLiveTranscription(data.text, false);
+                            break;
+                        case 'audio_chunk':
+                            if (typeof data.data === 'string' && data.data.length) {
+                                audioBase64Chunks.push(data.data);
+                                if (!streamAnnounced) {
+                                    console.log('Output streaming to client');
+                                    streamAnnounced = true;
+                                }
+                                // Update UI
+                                setStreamVisible(true);
+                                setStreamStatus('Streaming');
+                                if (streamChunkCount) streamChunkCount.textContent = String(audioBase64Chunks.length);
+                                if (streamTotalChars) {
+                                    const total = audioBase64Chunks.reduce((acc, s) => acc + s.length, 0);
+                                    streamTotalChars.textContent = String(total);
+                                }
+                                if (streamChunksList) {
+                                    const row = document.createElement('div');
+                                    row.className = 'stream-chunk-row';
+                                    row.textContent = `Chunk ${audioBase64Chunks.length}: ${data.data.slice(0, 64)}...`;
+                                    streamChunksList.prepend(row);
+                                }
+                            }
+                            break;
+                        case 'audio_stream_end':
+                            // Log final acknowledgement and size; do not auto-play
+                            console.log('Output sent to client');
+                            setStreamStatus('Completed');
+                            // keep the list visible for context; reset counters for next turn after small delay
+                            setTimeout(() => {
+                                if (streamChunkCount) streamChunkCount.textContent = '0';
+                                if (streamTotalChars) streamTotalChars.textContent = '0';
+                                audioBase64Chunks = [];
+                                streamAnnounced = false;
+                            }, 1200);
                             break;
                             
                         case 'final_transcript':
@@ -331,6 +405,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     clearInterval(fallbackCheckInterval);
                     fallbackCheckInterval = null;
                 }
+                streamAnnounced = false;
                 
                 // If no final transcript exists, start fallback polling
                 const alreadyRendered = document.querySelector(`.final-transcript[data-session-id="${currentSessionId}"]`);
@@ -354,6 +429,8 @@ document.addEventListener('DOMContentLoaded', function() {
                         }
                     }, 2000);
                 }
+                // Always reset audio chunks on close to avoid leaking state
+                audioBase64Chunks = [];
             };
 
             websocket.onerror = function(error) {
@@ -586,6 +663,22 @@ document.addEventListener('DOMContentLoaded', function() {
                     setTimeout(() => addLabel(p.trim(), 'you'), i * 250);
                 });
                 setStatus('Transcription complete.');
+
+                // Populate LLM output + audio element directly under Quick Transcribe
+                const llmSec = document.getElementById('qtLLMSection');
+                const llmText = document.getElementById('qtLLMText');
+                const llmAudio = document.getElementById('qtLLMAudio');
+                if (llmSec && llmText && llmAudio) {
+                    llmSec.classList.remove('hidden');
+                    llmText.textContent = data.llm_response || '(no LLM response)';
+                    if (data.audio_url) {
+                        llmAudio.src = data.audio_url;
+                        // Attempt autoplay; if blocked, controls are visible
+                        llmAudio.play().catch(() => {});
+                    } else {
+                        llmAudio.removeAttribute('src');
+                    }
+                }
             } else {
                 addLabel('Transcription failed.', 'ai');
                 setStatus(data.detail || data.message || 'Failed.');

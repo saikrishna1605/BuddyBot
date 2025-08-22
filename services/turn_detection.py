@@ -178,7 +178,24 @@ class TurnDetectionService:
                                 if isinstance(data, dict):
                                     if "audio" in data:
                                         print(data["audio"])  # base64
+                                        # Forward the base64 chunk to the browser client via the shared send_queue
+                                        try:
+                                            await send_queue.put({
+                                                "type": "audio_chunk",
+                                                "data": data["audio"],
+                                                "session_id": session_id,
+                                            })
+                                        except Exception as fe:
+                                            logger.debug(f"[TurnDetection] enqueue audio_chunk failed: {fe}")
                                     if data.get("final"):
+                                        # Notify client that audio streaming finished
+                                        try:
+                                            await send_queue.put({
+                                                "type": "audio_stream_end",
+                                                "session_id": session_id,
+                                            })
+                                        except Exception:
+                                            pass
                                         break
                         finally:
                             print("--- Murf WS audio stream end ---\n")
@@ -268,10 +285,7 @@ class TurnDetectionService:
                         client.disconnect(terminate=True)
                     except Exception:
                         pass
-                    try:
-                        await websocket.close(code=1000)
-                    except Exception:
-                        pass
+                    # Do not close the client websocket here; keep it open to stream audio chunks to the client
                     break
 
         async def send_messages():
@@ -279,8 +293,8 @@ class TurnDetectionService:
                 try:
                     payload = await asyncio.wait_for(send_queue.get(), timeout=2.0)
                     await websocket.send_text(json.dumps(payload))
-                    if payload.get("type") == "turn_end":
-                        # end after the turn for the demo
+                    # Keep the connection open past turn_end to deliver audio chunks; end when audio_stream_end is sent
+                    if payload.get("type") == "audio_stream_end":
                         break
                 except asyncio.TimeoutError:
                     continue

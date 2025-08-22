@@ -53,6 +53,24 @@
                 <div class="audio-container hidden">
                     <audio id="audioPlayback" controls></audio>
                 </div>
+                <!-- Day 21: Audio Streaming Panel -->
+                <div id="audioStreamCard" class="stream-card hidden">
+                    <div class="stream-card-header">
+                        <h3>Audio Streaming</h3>
+                        <span id="streamStatus" class="pill pill-waiting">Waiting</span>
+                    </div>
+                    <div class="stream-stats">
+                        <div class="stat">
+                            <div class="stat-label">Chunks</div>
+                            <div id="streamChunkCount" class="stat-value">0</div>
+                        </div>
+                        <div class="stat">
+                            <div class="stat-label">Total (chars)</div>
+                            <div id="streamTotalChars" class="stat-value">0</div>
+                        </div>
+                    </div>
+                    <div id="streamChunksList" class="stream-chunks"></div>
+                </div>
                 <div id="transcribeContainer" class="hidden">
                     <button id="transcribeBtn" type="button" class="hidden-button">Re-process Echo</button>
                     <p id="transcribingStatus" class="hidden">Processing echo...</p>
@@ -94,6 +112,12 @@
                 </div>
                 <div id="transcribeStatus" style="min-height: 20px; color:#555; font-style:italic; margin-bottom:8px;"></div>
                 <div id="transcribeLabels" style="display:flex; flex-direction:column; gap:8px;"></div>
+                <!-- LLM Output section with audio playback -->
+                <div id="qtLLMSection" class="qt-llm hidden" style="margin-top:12px;">
+                    <h3 class="qt-llm-title">LLM Output</h3>
+                    <div id="qtLLMText" class="qt-llm-text"></div>
+                    <audio id="qtLLMAudio" controls style="width:100%; margin-top:8px;"></audio>
+                </div>
             </div>
         </main>
     </div>

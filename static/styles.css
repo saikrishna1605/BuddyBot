@@ -399,6 +399,51 @@ main {
     text-shadow: 0 2px 4px rgba(102, 126, 234, 0.3);
 }
 
+/* Day 21: Audio streaming card */
+.stream-card {
+    margin-top: 18px;
+    padding: 16px;
+    border-radius: 16px;
+    background: rgba(33, 33, 66, 0.8);
+    border: 1px solid rgba(102, 126, 234, 0.25);
+    box-shadow: 0 8px 25px rgba(0, 0, 0, 0.2);
+}
+.stream-card-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 10px;
+}
+.stream-card h3 {
+    margin: 0;
+    font-size: 1.1rem;
+}
+.pill {
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 600;
+}
+.pill-waiting { background: rgba(255, 193, 7, 0.15); color: #ffc107; border: 1px solid rgba(255, 193, 7, 0.35); }
+.pill-active { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.4); }
+.pill-done   { background: rgba(102,126,234,0.15); color: #667eea; border: 1px solid rgba(102,126,234,0.4); }
+.stream-stats {
+    display: flex;
+    gap: 16px;
+    margin-bottom: 10px;
+}
+.stat { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 8px 12px; }
+.stat-label { font-size: 12px; color: #b3b3b3; }
+.stat-value { font-size: 16px; font-weight: 700; }
+.stream-chunks { max-height: 180px; overflow: auto; display: flex; flex-direction: column; gap: 6px; border-top: 1px dashed rgba(255,255,255,0.1); padding-top: 8px; }
+.stream-chunk-row { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; background: rgba(0,0,0,0.2); border: 1px solid rgba(255,255,255,0.06); border-radius: 8px; padding: 6px 8px; color: #ddd; }
+.hidden { display: none; }
+
+/* Quick Transcribe LLM output */
+.qt-llm { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 12px; }
+.qt-llm-title { margin: 0 0 8px 0; font-size: 1rem; color: #e0e0e0; }
+.qt-llm-text { color: #ddd; font-size: 0.95rem; line-height: 1.4; white-space: pre-wrap; }
+
 /* Chat Container and Messages */
 #chatContainer {
     max-height: 300px;
