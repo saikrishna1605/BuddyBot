@@ -25,7 +25,7 @@
                     </button>
                 </div>
                 <h1>AI Voice Agent</h1>
-                <div class="main-controls">
+                <div class="main-controls" style="position: relative; display: flex; justify-content: center; align-items: center; margin-bottom: 24px; min-height: 300px;">
                     <div class="particle"></div>
                     <div class="particle"></div>
                     <div class="particle"></div>
@@ -37,6 +37,10 @@
                         </div>
                         <span class="record-text">Start Recording</span>
                     </button>
+                    <div style="position: absolute; right: 0; top: 50%; transform: translateY(-50%); display:flex; flex-direction:column; gap:10px; align-items:center;">
+                        <button id="pauseBtn" type="button" style="background:#f59e0b;color:#111;border:none;border-radius:12px;padding:10px 14px;cursor:pointer; min-width:120px;">Pause</button>
+                        <button id="resumeBtn" type="button" style="background:#10b981;color:#111;border:none;border-radius:12px;padding:10px 14px;cursor:pointer; min-width:120px;">Resume</button>
+                    </div>
                 </div>
                 <div class="recording-indicator hidden" id="recordingIndicator">
                     <div class="recording-dot"></div>
@@ -59,17 +63,11 @@
                         <h3>Audio Streaming</h3>
                         <span id="streamStatus" class="pill pill-waiting">Waiting</span>
                     </div>
-                    <div class="stream-stats">
-                        <div class="stat">
-                            <div class="stat-label">Chunks</div>
-                            <div id="streamChunkCount" class="stat-value">0</div>
-                        </div>
-                        <div class="stat">
-                            <div class="stat-label">Total (chars)</div>
-                            <div id="streamTotalChars" class="stat-value">0</div>
-                        </div>
-                    </div>
+                    <!-- Removed Chunks and Total (chars) stats -->
                     <div id="streamChunksList" class="stream-chunks"></div>
+                    <div id="liveAudioContainer" style="margin-top:8px;">
+                        <audio id="liveAudio" controls style="width:100%;"></audio>
+                    </div>
                 </div>
                 <div id="transcribeContainer" class="hidden">
                     <button id="transcribeBtn" type="button" class="hidden-button">Re-process Echo</button>
@@ -96,32 +94,6 @@
             
         </main>
     </div>
-    
-    <!-- Lightweight Transcriber (separate from main streaming) -->
-    <div class="container" style="margin-top: 24px;">
-        <main>
-            <div class="voice-agent">
-                <h2 style="margin-top: 8px;">Quick Transcribe</h2>
-                <p style="margin: 0 0 10px 0; color: #666;">Record or upload audio, then see the transcription appear as labeled chunks.</p>
-                <div style="display:flex; gap:10px; flex-wrap: wrap; align-items:center; margin-bottom:10px;">
-                    <button id="transcribeStartBtn" type="button" style="background:#1976d2;color:#fff;border:none;border-radius:10px;padding:10px 14px;cursor:pointer;">Start Transcription Recording</button>
-                    <button id="transcribeStopBtn" type="button" style="background:#d32f2f;color:#fff;border:none;border-radius:10px;padding:10px 14px;cursor:pointer;" disabled>Stop</button>
-                    <button id="transcribeClearBtn" type="button" style="background:#607d8b;color:#fff;border:none;border-radius:10px;padding:10px 14px;cursor:pointer;">Clear</button>
-                    <input id="transcribeFileInput" type="file" accept="audio/*" style="display:inline-block;" />
-                    <button id="transcribeUploadBtn" type="button" style="background:#009688;color:#fff;border:none;border-radius:10px;padding:10px 14px;cursor:pointer;">Transcribe File</button>
-                </div>
-                <div id="transcribeStatus" style="min-height: 20px; color:#555; font-style:italic; margin-bottom:8px;"></div>
-                <div id="transcribeLabels" style="display:flex; flex-direction:column; gap:8px;"></div>
-                <!-- LLM Output section with audio playback -->
-                <div id="qtLLMSection" class="qt-llm hidden" style="margin-top:12px;">
-                    <h3 class="qt-llm-title">LLM Output</h3>
-                    <div id="qtLLMText" class="qt-llm-text"></div>
-                    <audio id="qtLLMAudio" controls style="width:100%; margin-top:8px;"></audio>
-                </div>
-            </div>
-        </main>
-    </div>
-
-    <script src="/static/script.js?v=3.1.0"></script>
+        <script src="/static/script.js?v=3.1.0"></script>
 </body>
 </html>

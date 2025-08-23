@@ -6,10 +6,13 @@ from datetime import datetime
 from typing import Optional, Callable
 import threading
 import contextlib
+import concurrent.futures
 
 import websockets
 
 import google.generativeai as genai
+from starlette.websockets import WebSocketDisconnect
+from services.transcription_cache import add_transcription_to_cache
 
 from assemblyai.streaming.v3 import (
     BeginEvent,
@@ -58,18 +61,23 @@ class TurnDetectionService:
         session_id: str,
         send_queue: asyncio.Queue,
         on_final: Optional[Callable[[str], None]] = None,
+        state: Optional[dict] = None,
     ) -> None:
         latest_partial: Optional[str] = None
-        got_final = False
+        # Track last finalized turn to prevent duplicate finals (e.g., unformatted + formatted)
+        if state is not None and "last_final_turn" not in state:
+            state["last_final_turn"] = None
 
         def on_begin(_c, event: BeginEvent):
             logger.info(f"[TurnDetection] Begin: {event.id}")
 
         def on_turn(_c, event: TurnEvent):
-            nonlocal latest_partial, got_final
+            nonlocal latest_partial
             try:
                 if not event.end_of_turn and event.transcript:
                     latest_partial = event.transcript
+                    if state is not None:
+                        state["latest_partial"] = latest_partial
                     asyncio.run_coroutine_threadsafe(
                         send_queue.put({
                             "type": "partial_transcript",
@@ -80,8 +88,19 @@ class TurnDetectionService:
                         loop,
                     )
                 elif event.end_of_turn and event.transcript:
-                    got_final = True
+                    # Deduplicate: skip if we've already finalized this turn_order
+                    if state is not None and state.get("last_final_turn") == event.turn_order:
+                        return
+                    if state is not None:
+                        state["got_final"] = True
                     final_text = event.transcript
+                    if state is not None:
+                        state["last_final_turn"] = event.turn_order
+                    # Record final transcript to cache for fallback retrieval
+                    try:
+                        add_transcription_to_cache(final_text, session_id)
+                    except Exception:
+                        pass
                     asyncio.run_coroutine_threadsafe(
                         send_queue.put({
                             "type": "final_transcript",
@@ -134,19 +153,18 @@ class TurnDetectionService:
         client.on(StreamingEvents.Error, on_error)
 
     async def stream_handler(self, websocket, api_key: str):
-        """A minimal, focused handler for Day 18 turn detection demo."""
+        """Turn detection WS with pause/resume, fallback finalization, and LLM→Murf streaming."""
         await websocket.accept()
         session_id = f"turn_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         loop = asyncio.get_running_loop()
         send_queue: asyncio.Queue = asyncio.Queue()
-        # Murf streaming queue to forward LLM chunks to TTS
         murf_queue: asyncio.Queue = asyncio.Queue()
-        murf_task: Optional[asyncio.Task] = None
+        murf_future: Optional[concurrent.futures.Future] = None
+        paused: bool = False
 
         client = self.create_client()
 
         async def murf_ws_worker(static_ctx: str):
-            """Open a Murf WS, forward text chunks from murf_queue, and print base64 audio."""
             if not MURF_KEY:
                 logger.warning("[TurnDetection] MURF_API_KEY missing; skipping Murf WS TTS")
                 return
@@ -178,7 +196,6 @@ class TurnDetectionService:
                                 if isinstance(data, dict):
                                     if "audio" in data:
                                         print(data["audio"])  # base64
-                                        # Forward the base64 chunk to the browser client via the shared send_queue
                                         try:
                                             await send_queue.put({
                                                 "type": "audio_chunk",
@@ -188,7 +205,6 @@ class TurnDetectionService:
                                         except Exception as fe:
                                             logger.debug(f"[TurnDetection] enqueue audio_chunk failed: {fe}")
                                     if data.get("final"):
-                                        # Notify client that audio streaming finished
                                         try:
                                             await send_queue.put({
                                                 "type": "audio_stream_end",
@@ -201,7 +217,6 @@ class TurnDetectionService:
                             print("--- Murf WS audio stream end ---\n")
 
                     recv_task = asyncio.create_task(receiver())
-                    # Sender loop: forward chunks
                     while True:
                         item = await murf_queue.get()
                         if isinstance(item, dict) and item.get("end"):
@@ -209,7 +224,6 @@ class TurnDetectionService:
                             break
                         if isinstance(item, dict) and "text" in item:
                             await ws.send(json.dumps({"context_id": static_ctx, "text": item["text"]}))
-                    # Wait for receiver to finish after final
                     with contextlib.suppress(Exception):
                         await recv_task
             except Exception as e:
@@ -226,14 +240,11 @@ class TurnDetectionService:
                 logger.info("[TurnDetection] LLM streaming input text: %s", text[:300])
                 model = genai.GenerativeModel('gemini-1.5-flash')
                 stream = model.generate_content(prompt, stream=True)
-                chunks = []
                 print("\n=== Streaming LLM response (Gemini) ===")
                 for chunk in stream:
                     part = getattr(chunk, 'text', '') or ''
                     if part:
                         print(part, end='', flush=True)
-                        chunks.append(part)
-                        # Forward this chunk to Murf WS via the async queue
                         try:
                             asyncio.run_coroutine_threadsafe(murf_queue.put({"text": part}), loop)
                         except Exception as fe:
@@ -243,9 +254,6 @@ class TurnDetectionService:
                     stream.resolve()
                 except Exception:
                     pass
-                full_text = ''.join(chunks).strip()
-                logger.info("[TurnDetection] LLM streamed response length: %d", len(full_text))
-                # Signal end to Murf so it can finalize
                 try:
                     asyncio.run_coroutine_threadsafe(murf_queue.put({"end": True}), loop)
                 except Exception:
@@ -254,46 +262,131 @@ class TurnDetectionService:
                 logger.exception(f"[TurnDetection] LLM streaming error: {e}")
 
         def on_final(text: str):
-            # Start Murf worker with a static context_id to avoid context limit issues
-            nonlocal murf_task
+            nonlocal murf_future
             static_ctx = f"{session_id}_ctx"
-            if not murf_task or murf_task.done():
-                murf_task = asyncio.create_task(murf_ws_worker(static_ctx))
-            # Launch LLM streaming in a background thread; chunks will be forwarded to Murf
+            if not murf_future or murf_future.done():
+                try:
+                    murf_future = asyncio.run_coroutine_threadsafe(murf_ws_worker(static_ctx), loop)
+                except RuntimeError as e:
+                    logger.warning(f"[TurnDetection] Could not schedule Murf WS worker: {e}")
             threading.Thread(target=stream_llm_response, args=(text,), daemon=True).start()
 
-        self.wire_handlers(client, loop, session_id, send_queue, on_final)
+        state = {"latest_partial": None, "got_final": False}
+        self.wire_handlers(client, loop, session_id, send_queue, on_final, state)
         self.connect(client)
 
-        await websocket.send_text(
-            json.dumps(
-                {
-                    "type": "connection_established",
-                    "message": "Turn detection ready",
-                    "session_id": session_id,
-                }
-            )
-        )
+        await websocket.send_text(json.dumps({
+            "type": "connection_established",
+            "message": "Turn detection ready",
+            "session_id": session_id,
+        }))
 
         async def recv_audio():
+            nonlocal paused
             while True:
-                msg = await websocket.receive()
+                try:
+                    msg = await websocket.receive()
+                except WebSocketDisconnect:
+                    try:
+                        if not state.get("got_final") and state.get("latest_partial"):
+                            final_text = state["latest_partial"]
+                            # Save fallback final to cache
+                            try:
+                                add_transcription_to_cache(final_text, session_id)
+                            except Exception:
+                                pass
+                            await send_queue.put({
+                                "type": "final_transcript",
+                                "text": final_text,
+                                "session_id": session_id,
+                                "turn_order": 1,
+                                "is_formatted": False,
+                            })
+                            await send_queue.put({
+                                "type": "turn_end",
+                                "session_id": session_id,
+                                "turn_order": 1,
+                            })
+                            on_final(final_text)
+                    except Exception:
+                        pass
+                    break
+                except RuntimeError:
+                    try:
+                        if not state.get("got_final") and state.get("latest_partial"):
+                            final_text = state["latest_partial"]
+                            try:
+                                add_transcription_to_cache(final_text, session_id)
+                            except Exception:
+                                pass
+                            await send_queue.put({
+                                "type": "final_transcript",
+                                "text": final_text,
+                                "session_id": session_id,
+                                "turn_order": 1,
+                                "is_formatted": False,
+                            })
+                            await send_queue.put({
+                                "type": "turn_end",
+                                "session_id": session_id,
+                                "turn_order": 1,
+                            })
+                            on_final(final_text)
+                    except Exception:
+                        pass
+                    break
                 if "bytes" in msg:
-                    client.stream(msg["bytes"])
+                    if not paused:
+                        client.stream(msg["bytes"])
                 elif "text" in msg and msg["text"] == "stop_streaming":
                     try:
                         client.disconnect(terminate=True)
                     except Exception:
                         pass
-                    # Do not close the client websocket here; keep it open to stream audio chunks to the client
+                    try:
+                        if not state.get("got_final") and state.get("latest_partial"):
+                            final_text = state["latest_partial"]
+                            try:
+                                add_transcription_to_cache(final_text, session_id)
+                            except Exception:
+                                pass
+                            await send_queue.put({
+                                "type": "final_transcript",
+                                "text": final_text,
+                                "session_id": session_id,
+                                "turn_order": 1,
+                                "is_formatted": False,
+                            })
+                            await send_queue.put({
+                                "type": "turn_end",
+                                "session_id": session_id,
+                                "turn_order": 1,
+                            })
+                            on_final(final_text)
+                    except Exception:
+                        pass
                     break
+                elif "text" in msg and msg["text"] in ("pause", "pause_streaming"):
+                    paused = True
+                    try:
+                        await send_queue.put({"type": "paused", "session_id": session_id})
+                    except Exception:
+                        pass
+                elif "text" in msg and msg["text"] in ("resume", "resume_streaming"):
+                    paused = False
+                    try:
+                        await send_queue.put({"type": "resumed", "session_id": session_id})
+                    except Exception:
+                        pass
 
         async def send_messages():
             while True:
                 try:
                     payload = await asyncio.wait_for(send_queue.get(), timeout=2.0)
-                    await websocket.send_text(json.dumps(payload))
-                    # Keep the connection open past turn_end to deliver audio chunks; end when audio_stream_end is sent
+                    try:
+                        await websocket.send_text(json.dumps(payload))
+                    except Exception:
+                        break
                     if payload.get("type") == "audio_stream_end":
                         break
                 except asyncio.TimeoutError:
@@ -306,11 +399,9 @@ class TurnDetectionService:
                 client.disconnect(terminate=True)
             except Exception:
                 pass
-            # Close Murf worker if still running
-            if murf_task and not murf_task.done():
-                murf_task.cancel()
+            if murf_future and not murf_future.done():
                 with contextlib.suppress(Exception):
-                    await murf_task
+                    await asyncio.wrap_future(murf_future)
             try:
                 await websocket.close()
             except Exception:

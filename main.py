@@ -126,20 +126,10 @@ class ChatManager:
             return True
         return False
 
-# Global variable to store recent transcriptions
-recent_transcriptions = []
-
-def add_transcription_to_cache(text: str, session_id: str):
-    """Add transcription to recent cache for fallback retrieval"""
-    global recent_transcriptions
-    transcription = {
-        "text": text,
-        "session_id": session_id,
-        "timestamp": datetime.now().isoformat()
-    }
-    recent_transcriptions.append(transcription)
-    # Keep only last 10 transcriptions
-    recent_transcriptions = recent_transcriptions[-10:]
+from services.transcription_cache import (
+    add_transcription_to_cache,
+    get_recent_transcriptions as get_recent_transcriptions_cache,
+)
 
 chat_manager = ChatManager()
 
@@ -973,12 +963,8 @@ async def clear_chat_history(session_id: str):
 @app.get("/recent-transcriptions")
 async def get_recent_transcriptions():
     """Get recent transcriptions as fallback when WebSocket fails"""
-    global recent_transcriptions
-    return {
-        "transcriptions": recent_transcriptions,
-        "count": len(recent_transcriptions),
-        "message": "Recent transcription results"
-    }
+    recents = get_recent_transcriptions_cache()
+    return {"transcriptions": recents, "count": len(recents), "message": "Recent transcription results"}
 
 @app.post("/transcribe/file")
 async def transcribe_file(file: UploadFile = File(...)):

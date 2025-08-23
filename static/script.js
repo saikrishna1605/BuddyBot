@@ -3,6 +3,8 @@ document.addEventListener('DOMContentLoaded', function() {
     // Voice recording elements
     const recordBtn = document.getElementById('recordBtn');
     const resetBtn = document.getElementById('resetBtn');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const resumeBtn = document.getElementById('resumeBtn');
     const recordingIndicator = document.getElementById('recordingIndicator');
     const processingIndicator = document.getElementById('processingIndicator');
     const chatContainer = document.getElementById('chatContainer');
@@ -16,6 +18,8 @@ document.addEventListener('DOMContentLoaded', function() {
     let websocket = null;
     let currentTranscriptDiv = null;
     let fallbackCheckInterval = null;
+    // Track if we got a final transcript this WS session (prevents false fallback)
+    let finalReceivedForSession = false;
     // For Day 21: accumulate streamed base64 audio chunks from server
     let audioBase64Chunks = [];
     // Minimal streaming acknowledgement flags
@@ -24,9 +28,25 @@ document.addEventListener('DOMContentLoaded', function() {
     // UI handles for streaming panel
     const audioStreamCard = document.getElementById('audioStreamCard');
     const streamStatus = document.getElementById('streamStatus');
-    const streamChunkCount = document.getElementById('streamChunkCount');
-    const streamTotalChars = document.getElementById('streamTotalChars');
+    // Removed streamChunkCount and streamTotalChars
     const streamChunksList = document.getElementById('streamChunksList');
+    const liveAudioEl = document.getElementById('liveAudio');
+
+    // Control flags and audio graph refs
+    let paused = false; // mic capture pause
+    let audioContext = null; // capture context
+    let source = null;
+    let processor = null;
+    let micStream = null;
+    let turnEnded = false; // avoid handling turn_end twice
+
+    // Playback pipeline via Web Audio API (append PCM parsed from WAV chunks)
+    let playbackCtx = null;
+    let playbackTimeCursor = 0; // seconds
+    let wavHeaderParsed = false;
+    let wavChannels = 1;
+    let wavSampleRate = 44100;
+    let wavBitsPerSample = 16;
 
     function setStreamVisible(visible) {
         if (!audioStreamCard) return;
@@ -77,7 +97,7 @@ document.addEventListener('DOMContentLoaded', function() {
         chatContainer.scrollTop = chatContainer.scrollHeight;
     }
     
-    function showLiveTranscription(text, isFinal = false, sessionId = currentSessionId) {
+    function showLiveTranscription(text, isFinal = false, sessionId = currentSessionId, turnOrder = null) {
         if (!currentTranscriptDiv) {
             currentTranscriptDiv = document.createElement('div');
             currentTranscriptDiv.className = 'message user live-transcript';
@@ -93,6 +113,16 @@ document.addEventListener('DOMContentLoaded', function() {
         currentTranscriptDiv.textContent = text;
         
         if (isFinal) {
+            // If a final transcript for this session+turn already exists, update it instead of duplicating
+            const turnSel = turnOrder !== null ? `[data-turn="${turnOrder}"]` : '';
+            const existingFinal = document.querySelector(`.final-transcript[data-session-id="${sessionId}"]${turnSel}`);
+            if (existingFinal) {
+                existingFinal.textContent = text;
+                // no history duplicate
+                currentTranscriptDiv = null;
+                chatContainer.scrollTop = chatContainer.scrollHeight;
+                return;
+            }
             currentTranscriptDiv.style.cssText = `
                 background: linear-gradient(135deg, #f3e5f5, #e1bee7);
                 border-left: 4px solid #9c27b0;
@@ -100,8 +130,9 @@ document.addEventListener('DOMContentLoaded', function() {
                 font-style: normal;
             `;
             currentTranscriptDiv.className = 'message user final-transcript';
-            // Tag the element with the session ID to prevent duplicates from the fallback
+            // Tag the element with the session ID and turn for dedupe
             currentTranscriptDiv.setAttribute('data-session-id', sessionId);
+            if (turnOrder !== null) currentTranscriptDiv.setAttribute('data-turn', String(turnOrder));
             
             // Add to chat history
             addMessageToHistory(sessionId, 'user', text);
@@ -111,6 +142,25 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         
         chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+
+    // Safely tear down audio graph and close context without unhandled rejections
+    async function teardownAudioGraph() {
+        try { if (processor) { processor.disconnect(); } } catch {}
+        try { if (source) { source.disconnect(); } } catch {}
+        processor = null; source = null;
+        try {
+            if (micStream) {
+                micStream.getTracks().forEach(t => { try { t.stop(); } catch {} });
+            }
+        } catch {}
+        micStream = null;
+        try {
+            if (audioContext && audioContext.state !== 'closed') {
+                await audioContext.close().catch(() => {});
+            }
+        } catch {}
+        audioContext = null;
     }
     
     function showProcessingMessage(message) {
@@ -154,7 +204,7 @@ document.addEventListener('DOMContentLoaded', function() {
             }
             const data = await response.json();
             
-            if (data.transcriptions && data.transcriptions.length > 0) {
+        if (data.transcriptions && data.transcriptions.length > 0) {
                 // Check if any of the recent transcriptions match our session ID
                 const foundTranscription = data.transcriptions.find(t => t.session_id === currentSessionId);
 
@@ -164,6 +214,8 @@ document.addEventListener('DOMContentLoaded', function() {
                 if (foundTranscription && !alreadyRendered) {
                     console.log('📥 Fallback: Found transcription from server:', foundTranscription.text);
                     showLiveTranscription(foundTranscription.text, true, currentSessionId);
+            // Ensure we don't show fallback error after WS close
+            finalReceivedForSession = true;
                     
                     // Clear the interval since we found the transcription
                     if (fallbackCheckInterval) {
@@ -251,6 +303,24 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         });
     }
+
+    // Pause/Resume controls
+    if (pauseBtn) {
+        pauseBtn.addEventListener('click', () => {
+            paused = true;
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.send('pause');
+            }
+        });
+    }
+    if (resumeBtn) {
+        resumeBtn.addEventListener('click', () => {
+            paused = false;
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.send('resume');
+            }
+        });
+    }
     
     // Reset button functionality
     if (resetBtn) {
@@ -292,21 +362,11 @@ document.addEventListener('DOMContentLoaded', function() {
                                 currentSessionId = data.session_id;
                                 console.log('🔑 Session ID set by server:', currentSessionId);
                             }
+                            // Reset flags for this new session
+                            finalReceivedForSession = false;
+                            turnEnded = false;
                             break;
-                        case 'audio_chunk':
-                            // Accumulate base64 chunks and log acknowledgement
-                            if (typeof data.data === 'string' && data.data.length) {
-                                audioBase64Chunks.push(data.data);
-                                console.log(`🎧 Audio chunk received (${audioBase64Chunks.length})`);
-                            }
-                            break;
-                        case 'audio_stream_end':
-                            // Log final acknowledgement and size; do not auto-play
-                            const totalChars1 = audioBase64Chunks.reduce((acc, s) => acc + s.length, 0);
-                            console.log(`✅ Audio stream complete. Chunks: ${audioBase64Chunks.length}, total base64 chars: ${totalChars1}`);
-                            // Reset for next turn
-                            audioBase64Chunks = [];
-                            break;
+                        // (audio_chunk and audio_stream_end handled below with full UI + playback)
                             
                         case 'transcribing':
                             console.log('⏳ Processing audio...');
@@ -327,11 +387,6 @@ document.addEventListener('DOMContentLoaded', function() {
                                 // Update UI
                                 setStreamVisible(true);
                                 setStreamStatus('Streaming');
-                                if (streamChunkCount) streamChunkCount.textContent = String(audioBase64Chunks.length);
-                                if (streamTotalChars) {
-                                    const total = audioBase64Chunks.reduce((acc, s) => acc + s.length, 0);
-                                    streamTotalChars.textContent = String(total);
-                                }
                                 if (streamChunksList) {
                                     const row = document.createElement('div');
                                     row.className = 'stream-chunk-row';
@@ -341,16 +396,40 @@ document.addEventListener('DOMContentLoaded', function() {
                             }
                             break;
                         case 'audio_stream_end':
-                            // Log final acknowledgement and size; do not auto-play
-                            console.log('Output sent to client');
-                            setStreamStatus('Completed');
-                            // keep the list visible for context; reset counters for next turn after small delay
+                            // Assemble the WAV into the audio element; do not auto-play
+                            console.log('Output streaming complete. Preparing audio element...');
+                            try {
+                                if (liveAudioEl && audioBase64Chunks.length) {
+                                    const b64 = audioBase64Chunks.join('');
+                                    const src = `data:audio/wav;base64,${b64}`;
+                                    liveAudioEl.src = src;
+                                    try { liveAudioEl.load(); } catch {}
+                                    const container = document.getElementById('liveAudioContainer');
+                                    if (container) container.classList.remove('hidden');
+                                    liveAudioEl.classList.remove('hidden');
+                                    // Ensure the panel is visible even if no prior chunks toggled it
+                                    setStreamVisible(true);
+                                }
+                            } catch (e) {
+                                console.warn('Could not prepare audio element:', e);
+                            }
+                            setStreamStatus('Ready');
+                            // Reset playback parsing state; keep chunks until after src is set
                             setTimeout(() => {
-                                if (streamChunkCount) streamChunkCount.textContent = '0';
-                                if (streamTotalChars) streamTotalChars.textContent = '0';
+                                playbackTimeCursor = playbackCtx ? playbackCtx.currentTime : 0;
+                                wavHeaderParsed = false;
+                            }, 100);
+                            // keep the list visible for context; reset chunk state for next turn after small delay
+                            setTimeout(() => {
                                 audioBase64Chunks = [];
                                 streamAnnounced = false;
                             }, 1200);
+                            break;
+                        case 'paused':
+                            console.log('⏸️ Server acknowledged pause');
+                            break;
+                        case 'resumed':
+                            console.log('▶️ Server acknowledged resume');
                             break;
                             
                         case 'final_transcript':
@@ -360,18 +439,18 @@ document.addEventListener('DOMContentLoaded', function() {
                                 clearInterval(fallbackCheckInterval);
                                 fallbackCheckInterval = null;
                             }
-                            showLiveTranscription(data.text, true);
+                            // Mark that we do have a final transcript for this session
+                            finalReceivedForSession = true;
+                            showLiveTranscription(data.text, true, currentSessionId, (typeof data.turn_order === 'number' ? data.turn_order : null));
                             break;
                         
                         case 'turn_end':
-                            console.log('🛑 Turn ended by server.');
-                            // Optionally show a subtle UI cue that turn has ended
-                            // Close WebSocket after a short delay to finish any server cleanup
-                            setTimeout(() => {
-                                if (websocket && websocket.readyState === WebSocket.OPEN) {
-                                    websocket.close(1000, 'Turn ended');
-                                }
-                            }, 300);
+                            if (!turnEnded) {
+                                console.log('🛑 Turn ended by server.');
+                                turnEnded = true;
+                            }
+                            // Do NOT close the WebSocket here; keep it open to receive audio chunks
+                            // The server will send 'audio_stream_end' when TTS streaming completes
                             break;
                             
                         case 'transcription_error':
@@ -409,7 +488,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 
                 // If no final transcript exists, start fallback polling
                 const alreadyRendered = document.querySelector(`.final-transcript[data-session-id="${currentSessionId}"]`);
-                if (!alreadyRendered) {
+                if (!alreadyRendered && !finalReceivedForSession) {
                     console.log('🔄 No final transcript found. Starting fallback check...');
                     let checkCount = 0;
                     const maxChecks = 10; // 10 checks * 2 seconds = 20 seconds timeout
@@ -439,7 +518,7 @@ document.addEventListener('DOMContentLoaded', function() {
             };
 
             // Get microphone access (we'll stream raw PCM 16k mono to server)
-            const stream = await navigator.mediaDevices.getUserMedia({ 
+            micStream = await navigator.mediaDevices.getUserMedia({ 
                 audio: {
                     echoCancellation: true,
                     noiseSuppression: true,
@@ -448,17 +527,18 @@ document.addEventListener('DOMContentLoaded', function() {
             });
 
             // Fallback MediaRecorder (used only if we need to upload a blob later)
-            mediaRecorder = new MediaRecorder(stream, { mimeType: 'audio/webm;codecs=opus' });
+            mediaRecorder = new MediaRecorder(micStream, { mimeType: 'audio/webm;codecs=opus' });
             audioChunks = [];
             mediaRecorder.ondataavailable = event => { if (event.data.size > 0) audioChunks.push(event.data); };
 
             // Live PCM streaming pipeline using Web Audio API
-            const audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-            const source = audioContext.createMediaStreamSource(stream);
-            const processor = audioContext.createScriptProcessor(4096, 1, 1);
+            audioContext = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+            source = audioContext.createMediaStreamSource(micStream);
+            processor = audioContext.createScriptProcessor(4096, 1, 1);
 
             processor.onaudioprocess = (e) => {
                 if (!(websocket && websocket.readyState === WebSocket.OPEN)) return;
+                if (paused) return;
                 const input = e.inputBuffer.getChannelData(0); // Float32 [-1,1]
                 const pcm16 = new Int16Array(input.length);
                 for (let i = 0; i < input.length; i++) {
@@ -514,9 +594,8 @@ document.addEventListener('DOMContentLoaded', function() {
                     }
                 }, 3000);
                 
-                // Stop the microphone track
-                const tracks = mediaRecorder.stream.getTracks();
-                tracks.forEach(track => track.stop());
+                // Teardown audio graph safely
+                try { await teardownAudioGraph(); } catch {}
                 
                 // Finalize any pending transcription
                 if (currentTranscriptDiv) {
@@ -542,7 +621,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
     
-    function stopRecording() {
+    async function stopRecording() {
         if (mediaRecorder && mediaRecorder.state !== 'inactive') {
             mediaRecorder.stop();
         }
@@ -568,6 +647,94 @@ document.addEventListener('DOMContentLoaded', function() {
         if (currentTranscriptDiv) {
             currentTranscriptDiv.style.opacity = '1';
             currentTranscriptDiv = null;
+        }
+        // Tear down audio graph safely
+        try { await teardownAudioGraph(); } catch {}
+    }
+
+    // ---------- Live playback helpers ----------
+    function ensurePlaybackCtx() {
+        if (!playbackCtx) {
+            playbackCtx = new (window.AudioContext || window.webkitAudioContext)();
+            playbackTimeCursor = playbackCtx.currentTime;
+        }
+        return playbackCtx;
+    }
+
+    function b64ToUint8Array(b64) {
+        const binary = atob(b64);
+        const len = binary.length;
+        const bytes = new Uint8Array(len);
+        for (let i = 0; i < len; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    }
+
+    function findDataChunkOffset(bytes) {
+        // Search for 'data' ASCII in the buffer
+        for (let i = 0; i < bytes.length - 4; i++) {
+            if (bytes[i] === 0x64 && bytes[i+1] === 0x61 && bytes[i+2] === 0x74 && bytes[i+3] === 0x61) {
+                // data chunk size is next 4 bytes LE
+                const size = bytes[i+4] | (bytes[i+5] << 8) | (bytes[i+6] << 16) | (bytes[i+7] << 24);
+                return { offset: i + 8, size };
+            }
+        }
+        return { offset: 44, size: bytes.length - 44 };
+    }
+
+    function parseWavHeaderIfNeeded(bytes) {
+        if (wavHeaderParsed) return 0;
+        // Basic RIFF check
+        if (bytes[0] === 0x52 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x46) {
+            // channels
+            wavChannels = bytes[22] | (bytes[23] << 8);
+            wavSampleRate = bytes[24] | (bytes[25] << 8) | (bytes[26] << 16) | (bytes[27] << 24);
+            wavBitsPerSample = bytes[34] | (bytes[35] << 8);
+            const dataLoc = findDataChunkOffset(bytes);
+            wavHeaderParsed = true;
+            return dataLoc.offset;
+        }
+        // No header found, assume raw PCM
+        wavHeaderParsed = true;
+        return 0;
+    }
+
+    function schedulePcm(bytes) {
+        const ctx = ensurePlaybackCtx();
+        // Convert 16-bit PCM little-endian mono/stereo to Float32
+        const bytesPerSample = wavBitsPerSample / 8;
+        const frameCount = Math.floor(bytes.length / (bytesPerSample * wavChannels));
+        const audioBuffer = ctx.createBuffer(wavChannels, frameCount, wavSampleRate);
+        for (let ch = 0; ch < wavChannels; ch++) {
+            const channel = audioBuffer.getChannelData(ch);
+            for (let i = 0; i < frameCount; i++) {
+                const idx = (i * wavChannels + ch) * bytesPerSample;
+                const lo = bytes[idx];
+                const hi = bytes[idx + 1];
+                // 16-bit signed
+                let sample = (hi << 8) | lo;
+                if (sample & 0x8000) sample = sample - 0x10000;
+                channel[i] = sample / 0x8000;
+            }
+        }
+        const src = ctx.createBufferSource();
+        src.buffer = audioBuffer;
+        src.connect(ctx.destination);
+        const startAt = Math.max(ctx.currentTime + 0.02, playbackTimeCursor);
+        try { src.start(startAt); } catch (e) { try { src.start(); } catch {} }
+        playbackTimeCursor = startAt + audioBuffer.duration;
+    }
+
+    function handleIncomingAudioChunk(b64) {
+        const bytes = b64ToUint8Array(b64);
+        let offset = 0;
+        if (!wavHeaderParsed) {
+            offset = parseWavHeaderIfNeeded(bytes);
+        }
+        const pcmBytes = bytes.subarray(offset);
+        if (pcmBytes.length) schedulePcm(pcmBytes);
+        if (liveAudioEl && liveAudioEl.paused) {
+            // Ensure some UI element is playing; link WebAudio output isn't via element, but keep for UX
+            try { liveAudioEl.play().catch(() => {}); } catch {}
         }
     }
     
@@ -597,10 +764,20 @@ document.addEventListener('DOMContentLoaded', function() {
                     addMessageToHistory(currentSessionId, 'assistant', data.llm_response);
                 }
                 
-                // Play audio response if available
-                if (data.audio_url) {
-                    const audio = new Audio(data.audio_url);
-                    audio.play().catch(e => console.log('Audio autoplay blocked'));
+                // Prepare audio element (no autoplay)
+        if (data.audio_url && liveAudioEl) {
+                    try {
+                        liveAudioEl.src = data.audio_url;
+                        try { liveAudioEl.load(); } catch {}
+                        const container = document.getElementById('liveAudioContainer');
+                        if (container) container.classList.remove('hidden');
+                        liveAudioEl.classList.remove('hidden');
+            // Show the streaming panel with the ready audio element
+            setStreamVisible(true);
+            setStreamStatus('Ready');
+                    } catch (e) {
+                        console.log('Could not set audio URL on element:', e);
+                    }
                 }
                 
             } else {
