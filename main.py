@@ -259,16 +259,16 @@ async def stream_llm_response(text: str, chat_history: List[ChatMessage] = None)
             model = genai.GenerativeModel('gemini-1.5-flash')
             stream = model.generate_content(context, stream=True)
             full: list[str] = []
-            print("\n--- LLM streaming start ---")
+            # Silence console streaming logs
             for chunk in stream:
                 try:
                     part = getattr(chunk, 'text', '') or ''
                 except Exception:
                     part = ''
                 if part:
-                    print(part, end='', flush=True)
+                    # no console print
                     full.append(part)
-            print("\n--- LLM streaming end ---\n")
+            # end of LLM streaming
             # Resolve to ensure full response is available if needed later
             try:
                 stream.resolve()
@@ -325,7 +325,7 @@ async def stream_tts_via_murf_ws(text: str, *, voice_id: str = "en-US-amara", sa
                 text_msg["context_id"] = context_id
             await ws.send(json.dumps(text_msg))
 
-            print("\n--- Murf WS audio stream (base64) ---")
+            # Suppress Murf WS audio base64 console prints
             first_chunk = True
             while True:
                 try:
@@ -339,8 +339,7 @@ async def stream_tts_via_murf_ws(text: str, *, voice_id: str = "en-US-amara", sa
                 if isinstance(data, dict):
                     if "audio" in data:
                         b64_audio: str = data["audio"]
-                        # Print the base64 string; per docs this includes WAV header in first chunk
-                        print(b64_audio)
+                        # No console print of base64 audio
                         # Optionally, we could decode and handle the header here; requirement is to print base64
                     if data.get("final"):
                         # Murf indicates synthesis is done for this context
@@ -348,7 +347,7 @@ async def stream_tts_via_murf_ws(text: str, *, voice_id: str = "en-US-amara", sa
                 else:
                     logger.debug(f"Non-dict message from Murf WS: {data}")
 
-            print("--- Murf WS audio stream end ---\n")
+            # end of Murf WS audio stream
     except Exception as e:
         logger.error(f"Murf WebSocket TTS error: {e}")
 
@@ -386,7 +385,7 @@ class MurfWsClient:
         self._recv_task = asyncio.create_task(self._receiver_loop())
 
     async def _receiver_loop(self):
-        print("\n--- Murf WS audio stream (base64) ---")
+        # Suppress Murf WS audio base64 console prints
         try:
             while True:
                 msg = await self._ws.recv()
@@ -397,7 +396,8 @@ class MurfWsClient:
                     continue
                 if isinstance(data, dict):
                     if "audio" in data:
-                        print(data["audio"])  # Requirement: print base64 encoded audio
+                        # No console print of base64 audio
+                        pass
                     if data.get("final"):
                         # Murf indicates synthesis for current context is complete
                         break
@@ -406,7 +406,8 @@ class MurfWsClient:
         except Exception as e:
             logger.warning(f"Murf WS receiver ended: {e}")
         finally:
-            print("--- Murf WS audio stream end ---\n")
+            # end of Murf WS audio stream
+            return
 
     async def send_text(self, text: str, *, end: bool = False, clear: bool = False):
         if not self._ws:
@@ -461,18 +462,18 @@ async def relay_llm_stream_to_murf(user_text: str, chat_history: Optional[List[C
         try:
             model = genai.GenerativeModel('gemini-1.5-flash')
             stream = model.generate_content(context, stream=True)
-            print("\n--- LLM streaming start ---")
+            # Silence console streaming logs
             for chunk in stream:
                 try:
                     part = getattr(chunk, 'text', '') or ''
                 except Exception:
                     part = ''
                 if part:
-                    print(part, end='', flush=True)
+                    # no console print
                     full_parts.append(part)
                     # forward to Murf on the event loop (not blocking this thread)
                     loop.call_soon_threadsafe(lambda p=part: asyncio.create_task(murf_client.send_text(p)))
-            print("\n--- LLM streaming end ---\n")
+            # end of LLM streaming
             try:
                 stream.resolve()
             except Exception:
@@ -620,15 +621,11 @@ async def streaming_ws(websocket: WebSocket):
                 logger.info(f"Turn {event.turn_order} completed: {event.transcript}")
                 got_final_transcript = True
                 
-                # Add to recent transcriptions for fallback mechanism
-                recent_transcriptions.append({
-                    "text": event.transcript,
-                    "session_id": session_id,
-                    "timestamp": datetime.now().isoformat()
-                })
-                # Trim list if it gets too large
-                if len(recent_transcriptions) > 100:
-                    recent_transcriptions.pop(0)
+                # Add to shared cache for fallback mechanism
+                try:
+                    add_transcription_to_cache(event.transcript, session_id)
+                except Exception:
+                    pass
                 
                 asyncio.run_coroutine_threadsafe(
                     message_queue.put({
@@ -655,12 +652,11 @@ async def streaming_ws(websocket: WebSocket):
             elif event.transcript and not hasattr(event, 'end_of_turn'):
                 logger.info(f"Transcript received without clear turn end: {event.transcript}")
                 latest_transcript_text = event.transcript
-                # Add to recent transcriptions for fallback
-                recent_transcriptions.append({
-                    "text": event.transcript,
-                    "session_id": session_id,
-                    "timestamp": datetime.now().isoformat()
-                })
+                # Add to shared cache for fallback
+                try:
+                    add_transcription_to_cache(event.transcript, session_id)
+                except Exception:
+                    pass
                 
                 asyncio.run_coroutine_threadsafe(
                     message_queue.put({
@@ -742,11 +738,10 @@ async def streaming_ws(websocket: WebSocket):
                         # If no final transcript was produced, emit the latest partial as final
                         if not got_final_transcript and latest_transcript_text:
                             logger.info(f"Finalizing transcript on stop (fallback): {latest_transcript_text}")
-                            recent_transcriptions.append({
-                                "text": latest_transcript_text,
-                                "session_id": session_id,
-                                "timestamp": datetime.now().isoformat()
-                            })
+                            try:
+                                add_transcription_to_cache(latest_transcript_text, session_id)
+                            except Exception:
+                                pass
                             await message_queue.put({
                                 "type": "final_transcript",
                                 "text": latest_transcript_text,

@@ -9,6 +9,9 @@ document.addEventListener('DOMContentLoaded', function() {
     const processingIndicator = document.getElementById('processingIndicator');
     const chatContainer = document.getElementById('chatContainer');
     const error = document.getElementById('error');
+    // Sidebar elements
+    const newChatBtn = document.getElementById('newChatBtn');
+    const sessionsList = document.getElementById('sessionsList');
     
     let mediaRecorder;
     let audioChunks = [];
@@ -26,19 +29,23 @@ document.addEventListener('DOMContentLoaded', function() {
     // Log once per streaming session
     let streamAnnounced = false;
     // UI handles for streaming panel
-    const audioStreamCard = document.getElementById('audioStreamCard');
-    const streamStatus = document.getElementById('streamStatus');
-    // Removed streamChunkCount and streamTotalChars
-    const streamChunksList = document.getElementById('streamChunksList');
-    const liveAudioEl = document.getElementById('liveAudio');
+    const audioStreamCard = null; // audio streaming card removed from DOM
+    const streamStatus = null; // status pill removed
+    // Removed stream chunk list UI
+    const streamChunksList = null;
+    const liveAudioEl = null; // HTML audio element removed
 
     // Control flags and audio graph refs
     let paused = false; // mic capture pause
+    let userPaused = false; // user-intent pause (buttons)
     let audioContext = null; // capture context
     let source = null;
     let processor = null;
     let micStream = null;
     let turnEnded = false; // avoid handling turn_end twice
+    // PCM aggregation buffers for ~1s chunks
+    let capturePcmQueue = []; // Array<Int16Array>
+    let captureQueuedSamples = 0;
 
     // Playback pipeline via Web Audio API (append PCM parsed from WAV chunks)
     let playbackCtx = null;
@@ -49,20 +56,86 @@ document.addEventListener('DOMContentLoaded', function() {
     let wavBitsPerSample = 16;
 
     function setStreamVisible(visible) {
-        if (!audioStreamCard) return;
-        audioStreamCard.classList.toggle('hidden', !visible);
+    // audio stream card removed; no-op
+    return;
     }
 
     function setStreamStatus(state) {
-        if (!streamStatus) return;
-        streamStatus.textContent = state;
-        streamStatus.classList.remove('pill-waiting', 'pill-active', 'pill-done');
-        if (state === 'Streaming') streamStatus.classList.add('pill-active');
-        else if (state === 'Completed') streamStatus.classList.add('pill-done');
-        else streamStatus.classList.add('pill-waiting');
+    // status pill removed; no-op
+    return;
     }
     
-    // Chat history functions
+    // Chat history + sessions
+    const SESSIONS_KEY = 'sessions_index_v1';
+    function getSessionsIndex() {
+        const raw = localStorage.getItem(SESSIONS_KEY);
+        return raw ? JSON.parse(raw) : [];
+    }
+    function saveSessionsIndex(list) {
+        localStorage.setItem(SESSIONS_KEY, JSON.stringify(list));
+    }
+    function upsertSession(sessionId, title) {
+        const list = getSessionsIndex();
+        const idx = list.findIndex(s => s.id === sessionId);
+        const entry = { id: sessionId, title: title || 'New chat', ts: Date.now() };
+        if (idx >= 0) list[idx] = entry; else list.unshift(entry);
+        saveSessionsIndex(list);
+        renderSessions(sessionId);
+    }
+    function deleteSession(sessionId) {
+        const list = getSessionsIndex().filter(s => s.id !== sessionId);
+        saveSessionsIndex(list);
+        // remove history
+        localStorage.removeItem(`chatHistory_${sessionId}`);
+        // If deleting current, switch to a fresh session
+        if (currentSessionId === sessionId) {
+            startNewChat();
+        } else {
+            renderSessions(currentSessionId);
+        }
+    }
+    function renderSessions(activeId) {
+        if (!sessionsList) return;
+        sessionsList.innerHTML = '';
+        const list = getSessionsIndex();
+        if (!list.length) {
+            // create initial session entry
+            upsertSession(currentSessionId, 'New chat');
+            return;
+        }
+        list.forEach(s => {
+            const item = document.createElement('div');
+            item.className = 'session-item' + (s.id === activeId ? ' active' : '');
+            const title = document.createElement('span');
+            title.className = 'session-title';
+            title.textContent = s.title || 'New chat';
+            const del = document.createElement('button');
+            del.className = 'delete-btn';
+            del.title = 'Delete chat';
+            del.textContent = '✕';
+            del.addEventListener('click', (e) => {
+                e.stopPropagation();
+                deleteSession(s.id);
+            });
+            item.addEventListener('click', () => {
+                if (currentSessionId !== s.id) {
+                    currentSessionId = s.id;
+                    displayChatHistory(currentSessionId);
+                    renderSessions(currentSessionId);
+                }
+            });
+            item.appendChild(title);
+            item.appendChild(del);
+            sessionsList.appendChild(item);
+        });
+    }
+    function startNewChat() {
+        currentSessionId = 'session_' + Date.now();
+        // clear view only (history for old sessions retained)
+        chatContainer.innerHTML = '';
+        upsertSession(currentSessionId, 'New chat');
+        displayChatHistory(currentSessionId);
+    }
     function saveChatHistory(sessionId, messages) {
         localStorage.setItem(`chatHistory_${sessionId}`, JSON.stringify(messages));
     }
@@ -81,6 +154,12 @@ document.addEventListener('DOMContentLoaded', function() {
         });
         saveChatHistory(sessionId, history);
         displayChatHistory(sessionId);
+        // Update session title from first user message
+        if (role === 'user') {
+            const firstLine = (content || '').split(/\n/)[0].trim();
+            const title = firstLine.slice(0, 40) || 'Conversation';
+            upsertSession(sessionId, title);
+        }
     }
     
     function displayChatHistory(sessionId) {
@@ -94,6 +173,112 @@ document.addEventListener('DOMContentLoaded', function() {
             chatContainer.appendChild(messageDiv);
         });
         
+        chatContainer.scrollTop = chatContainer.scrollHeight;
+    }
+
+    // Live assistant streaming UI elements
+    let currentAssistantDiv = null;
+    let assistantStreamActive = false;
+    // Auto pause/resume control to avoid feeding assistant speech into STT
+    let pausedByAssistant = false;
+    let pendingServerTts = 0;   // number of assistant streams expecting audio_stream_end
+    let pendingTextOnly = 0;    // number of assistant streams with no server TTS (text only)
+    function resumeMicAfterAssistantIfNeeded() {
+        if (!userPaused && pausedByAssistant) {
+            paused = false;
+            pausedByAssistant = false;
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                try { websocket.send('resume'); } catch {}
+            }
+            console.log('▶️ Mic resumed after assistant finished');
+        }
+    }
+    // Local TTS fallback when Murf is unavailable
+    const localTTS = {
+        enabled: false,
+        buf: '',
+        voice: null,
+        init(languageHint) {
+            if (!('speechSynthesis' in window)) return false;
+            this.enabled = true;
+            try {
+                const pick = () => {
+                    const vs = window.speechSynthesis.getVoices();
+                    if (!vs || !vs.length) return null;
+                    // Prefer an English voice; fallback to first
+                    let v = vs.find(v => /en|US|UK/i.test(v.lang)) || vs[0];
+                    return v || null;
+                };
+                // voices may load async
+                this.voice = pick();
+                if (!this.voice) {
+                    window.speechSynthesis.onvoiceschanged = () => { this.voice = pick(); };
+                }
+            } catch {}
+            return true;
+        },
+        speakChunk(text) {
+            if (!this.enabled || !text) return;
+            try {
+                const u = new SpeechSynthesisUtterance(text);
+                if (this.voice) u.voice = this.voice;
+                u.rate = 1.0; u.pitch = 1.0; u.volume = 1.0;
+                window.speechSynthesis.speak(u);
+            } catch {}
+        },
+        maybeSpeakDelta(delta) {
+            if (!this.enabled || !delta) return;
+            this.buf += delta;
+            // If we have punctuation or long chunk, speak and clear
+            const match = this.buf.match(/^[\s\S]*?[\.\!\?\:;\n]+/);
+            if (match) {
+                const part = match[0];
+                this.buf = this.buf.slice(part.length);
+                this.speakChunk(part.trim());
+            } else if (this.buf.length >= 140) {
+                const part = this.buf;
+                this.buf = '';
+                this.speakChunk(part.trim());
+            }
+        },
+        flush() {
+            if (!this.enabled) return;
+            const rem = this.buf.trim();
+            this.buf = '';
+            if (rem) this.speakChunk(rem);
+        },
+        reset() {
+            this.buf = '';
+        }
+    };
+    function showAssistantDelta(text, isFinal = false) {
+        if (!assistantStreamActive) return;
+        if (!currentAssistantDiv) {
+            currentAssistantDiv = document.createElement('div');
+            currentAssistantDiv.className = 'message assistant live-transcript';
+            currentAssistantDiv.style.cssText = `
+                background: linear-gradient(135deg, #ede7f6, #d1c4e9);
+                border-left: 4px solid #673AB7;
+                opacity: 0.95;
+                font-style: italic;
+            `;
+            chatContainer.appendChild(currentAssistantDiv);
+        }
+        // Append delta
+        currentAssistantDiv.textContent += text;
+        if (isFinal) {
+            currentAssistantDiv.style.cssText = `
+                background: linear-gradient(135deg, #e8f5e9, #c8e6c9);
+                border-left: 4px solid #2e7d32;
+                opacity: 1;
+                font-style: normal;
+            `;
+            currentAssistantDiv.className = 'message assistant final-transcript';
+            assistantStreamActive = false;
+            // Save to history
+            addMessageToHistory(currentSessionId, 'assistant', currentAssistantDiv.textContent);
+            currentAssistantDiv = null;
+        }
         chatContainer.scrollTop = chatContainer.scrollHeight;
     }
     
@@ -288,7 +473,10 @@ document.addEventListener('DOMContentLoaded', function() {
         console.error('Error:', message);
     }
     
-    // Initialize chat display
+    // Sidebar: wire new chat
+    if (newChatBtn) newChatBtn.addEventListener('click', startNewChat);
+    // Initialize sessions and chat display
+    renderSessions(currentSessionId);
     displayChatHistory(currentSessionId);
     
     // Record button functionality
@@ -307,7 +495,8 @@ document.addEventListener('DOMContentLoaded', function() {
     // Pause/Resume controls
     if (pauseBtn) {
         pauseBtn.addEventListener('click', () => {
-            paused = true;
+        paused = true;
+        userPaused = true;
             if (websocket && websocket.readyState === WebSocket.OPEN) {
                 websocket.send('pause');
             }
@@ -315,7 +504,8 @@ document.addEventListener('DOMContentLoaded', function() {
     }
     if (resumeBtn) {
         resumeBtn.addEventListener('click', () => {
-            paused = false;
+        paused = false;
+        userPaused = false;
             if (websocket && websocket.readyState === WebSocket.OPEN) {
                 websocket.send('resume');
             }
@@ -349,10 +539,12 @@ document.addEventListener('DOMContentLoaded', function() {
             };
             
             websocket.onmessage = function(event) {
-                console.log('Server response:', event.data);
-                
                 try {
                     const data = JSON.parse(event.data);
+                    // Keep console quiet for high-volume messages
+                    if (data.type && data.type !== 'audio_chunk') {
+                        // console.debug('WS event:', data.type);
+                    }
                     
                     switch(data.type) {
                         case 'connection_established':
@@ -377,42 +569,78 @@ document.addEventListener('DOMContentLoaded', function() {
                             console.log('📝 Partial transcript:', data.text);
                             showLiveTranscription(data.text, false);
                             break;
-                        case 'audio_chunk':
-                            if (typeof data.data === 'string' && data.data.length) {
-                                audioBase64Chunks.push(data.data);
-                                if (!streamAnnounced) {
-                                    console.log('Output streaming to client');
-                                    streamAnnounced = true;
+                        case 'assistant_stream_start':
+                            assistantStreamActive = true;
+                            // Create holder div
+                            showAssistantDelta('', false);
+                            // Disable local TTS fallback per requirement — only Murf should speak
+                            localTTS.enabled = false; localTTS.reset();
+                            // Auto-pause mic streaming to avoid assistant audio being transcribed
+                            paused = true; pausedByAssistant = true;
+                            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                                try { websocket.send('pause'); } catch {}
+                            }
+                            if (data.tts_unavailable) {
+                                pendingTextOnly += 1;
+                                // Inform user no audio will play until Murf is configured
+                                showError('Murf TTS not configured. Set MURF_API_KEY in your .env to hear audio.');
+                            } else {
+                                pendingServerTts += 1;
+                            }
+                            break;
+                        case 'assistant_delta':
+                            if (typeof data.text === 'string' && data.text.length) {
+                                showAssistantDelta(data.text, false);
+                                // No local TTS — avoid echo
+                            }
+                            break;
+                        case 'assistant_final':
+                            if (typeof data.text === 'string') {
+                                // Ensure stream is active and we have a div
+                                if (!assistantStreamActive) {
+                                    assistantStreamActive = true;
+                                    showAssistantDelta('', false);
                                 }
-                                // Update UI
-                                setStreamVisible(true);
-                                setStreamStatus('Streaming');
-                                if (streamChunksList) {
-                                    const row = document.createElement('div');
-                                    row.className = 'stream-chunk-row';
-                                    row.textContent = `Chunk ${audioBase64Chunks.length}: ${data.data.slice(0, 64)}...`;
-                                    streamChunksList.prepend(row);
+                                // Replace live text with final
+                                if (currentAssistantDiv) {
+                                    currentAssistantDiv.textContent = data.text;
+                                    showAssistantDelta('', true);
+                                } else {
+                                    // Create a final message directly
+                                    addMessageToHistory(currentSessionId, 'assistant', data.text);
+                                }
+                                // If this assistant stream was text-only (no server TTS), resume now
+                                if (pendingTextOnly > 0) {
+                                    pendingTextOnly -= 1;
+                                    if (pendingTextOnly === 0 && pendingServerTts === 0) {
+                                        resumeMicAfterAssistantIfNeeded();
+                                    }
                                 }
                             }
                             break;
-                        case 'audio_stream_end':
-                            // Assemble the WAV into the audio element; do not auto-play
-                            console.log('Output streaming complete. Preparing audio element...');
-                            try {
-                                if (liveAudioEl && audioBase64Chunks.length) {
-                                    const b64 = audioBase64Chunks.join('');
-                                    const src = `data:audio/wav;base64,${b64}`;
-                                    liveAudioEl.src = src;
-                                    try { liveAudioEl.load(); } catch {}
-                                    const container = document.getElementById('liveAudioContainer');
-                                    if (container) container.classList.remove('hidden');
-                                    liveAudioEl.classList.remove('hidden');
-                                    // Ensure the panel is visible even if no prior chunks toggled it
-                                    setStreamVisible(true);
-                                }
-                            } catch (e) {
-                                console.warn('Could not prepare audio element:', e);
+            case 'audio_chunk':
+                            if (typeof data.data === 'string' && data.data.length) {
+                                audioBase64Chunks.push(data.data);
+                                // silent; no console announcement of streaming
+                                streamAnnounced = true;
+                                // Update UI
+                                setStreamVisible(true);
+                                setStreamStatus('Streaming');
+                                // Hide per-chunk UI rows; keep only status pill
+                // Play this chunk immediately for low-latency feedback
+                try { handleIncomingAudioChunk(data.data); } catch (e) { console.debug('playback error (chunk):', e); }
                             }
+                            break;
+                        case 'audio_stream_end':
+                            // Server indicates Murf TTS stream completed; resume mic if not user-paused
+                            if (pendingServerTts > 0) {
+                                pendingServerTts -= 1;
+                            }
+                            if (pendingServerTts === 0 && pendingTextOnly === 0) {
+                                resumeMicAfterAssistantIfNeeded();
+                            }
+                            // HTML audio element removed; chunks already played via Web Audio
+                            setStreamVisible(false);
                             setStreamStatus('Ready');
                             // Reset playback parsing state; keep chunks until after src is set
                             setTimeout(() => {
@@ -472,8 +700,7 @@ document.addEventListener('DOMContentLoaded', function() {
                             console.log('Unknown message type:', data.type);
                     }
                 } catch (e) {
-                    // Handle non-JSON messages
-                    console.log('Non-JSON message:', event.data);
+                    // Ignore non-JSON frames
                 }
             };
             
@@ -536,6 +763,11 @@ document.addEventListener('DOMContentLoaded', function() {
             source = audioContext.createMediaStreamSource(micStream);
             processor = audioContext.createScriptProcessor(4096, 1, 1);
 
+            // Aggregate ~1 second of PCM before sending to reduce overhead and match spec
+            const TARGET_SAMPLES = 16000; // 1 second at 16kHz
+            capturePcmQueue = [];
+            captureQueuedSamples = 0;
+
             processor.onaudioprocess = (e) => {
                 if (!(websocket && websocket.readyState === WebSocket.OPEN)) return;
                 if (paused) return;
@@ -545,7 +777,31 @@ document.addEventListener('DOMContentLoaded', function() {
                     let s = Math.max(-1, Math.min(1, input[i]));
                     pcm16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
                 }
-                websocket.send(pcm16.buffer);
+                capturePcmQueue.push(pcm16);
+                captureQueuedSamples += pcm16.length;
+
+                // While we have >= 1s of audio, flush in 1s chunks
+                while (captureQueuedSamples >= TARGET_SAMPLES) {
+                    const chunk = new Int16Array(TARGET_SAMPLES);
+                    let filled = 0;
+                    while (filled < TARGET_SAMPLES && capturePcmQueue.length) {
+                        const head = capturePcmQueue[0];
+                        const needed = TARGET_SAMPLES - filled;
+                        if (head.length <= needed) {
+                            chunk.set(head, filled);
+                            filled += head.length;
+                            capturePcmQueue.shift();
+                        } else {
+                            // Split head
+                            chunk.set(head.subarray(0, needed), filled);
+                            const remainder = head.subarray(needed);
+                            capturePcmQueue[0] = remainder;
+                            filled += needed;
+                        }
+                    }
+                    captureQueuedSamples -= TARGET_SAMPLES;
+                    try { websocket.send(chunk.buffer); } catch (err) { console.debug('send chunk error:', err); }
+                }
             };
 
             source.connect(processor);
@@ -568,6 +824,21 @@ document.addEventListener('DOMContentLoaded', function() {
                 if (recordText) recordText.textContent = 'Start Recording';
                 recordingIndicator.classList.add('hidden');
                 
+                // Flush any remaining <1s PCM to backend before stopping
+                try {
+                    if (websocket && websocket.readyState === WebSocket.OPEN && captureQueuedSamples > 0) {
+                        let total = captureQueuedSamples;
+                        const flushBuf = new Int16Array(total);
+                        let off = 0;
+                        while (capturePcmQueue.length) {
+                            const seg = capturePcmQueue.shift();
+                            flushBuf.set(seg, off); off += seg.length;
+                        }
+                        captureQueuedSamples = 0;
+                        websocket.send(flushBuf.buffer);
+                    }
+                } catch {}
+
                 // Send a "stop_streaming" message to the server
                 if (websocket && websocket.readyState === WebSocket.OPEN) {
                     console.log('Sending stop_streaming message');
@@ -583,7 +854,8 @@ document.addEventListener('DOMContentLoaded', function() {
                     }
                     
                     const alreadyRendered = document.querySelector(`.final-transcript[data-session-id="${currentSessionId}"]`);
-                    if (!alreadyRendered && audioChunks.length > 0) {
+                    // Only fallback-upload if we truly never got a final transcript AND no assistant stream started
+                    if (!alreadyRendered && !finalReceivedForSession && !assistantStreamActive && audioChunks.length > 0) {
                         console.log('⛑️ Streaming fallback: uploading recorded audio to /agent/chat');
                         const completeBlob = new Blob(audioChunks, { type: 'audio/webm;codecs=opus' });
                         try {
@@ -626,15 +898,34 @@ document.addEventListener('DOMContentLoaded', function() {
             mediaRecorder.stop();
         }
         
+        // Mark user pause to prevent auto-resume
+        userPaused = true;
+
+        // Flush any remaining <1s PCM to backend before stopping/closing
+        try {
+            if (websocket && websocket.readyState === WebSocket.OPEN && captureQueuedSamples > 0) {
+                let total = captureQueuedSamples;
+                const flushBuf = new Int16Array(total);
+                let off = 0;
+                while (capturePcmQueue.length) {
+                    const seg = capturePcmQueue.shift();
+                    flushBuf.set(seg, off); off += seg.length;
+                }
+                captureQueuedSamples = 0;
+                websocket.send(flushBuf.buffer);
+            }
+        } catch {}
+
         // Send stop streaming message to server
         if (websocket && websocket.readyState === WebSocket.OPEN) {
             websocket.send('stop_streaming');
-            // Wait for server to close, but force close after 1s as safety
+            // Do not force-close if assistant response is still streaming; let server close
             setTimeout(() => {
+                if (assistantStreamActive || pendingServerTts > 0 || pendingTextOnly > 0) return;
                 if (websocket.readyState === WebSocket.OPEN) {
                     websocket.close(1000, 'Client stop');
                 }
-            }, 1000);
+            }, 1500);
         }
         
         isRecording = false;
@@ -732,10 +1023,7 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         const pcmBytes = bytes.subarray(offset);
         if (pcmBytes.length) schedulePcm(pcmBytes);
-        if (liveAudioEl && liveAudioEl.paused) {
-            // Ensure some UI element is playing; link WebAudio output isn't via element, but keep for UX
-            try { liveAudioEl.play().catch(() => {}); } catch {}
-        }
+    // No HTML audio element; audio is scheduled via Web Audio
     }
     
     async function processAudio(audioBlob) {
@@ -765,20 +1053,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
                 
                 // Prepare audio element (no autoplay)
-        if (data.audio_url && liveAudioEl) {
-                    try {
-                        liveAudioEl.src = data.audio_url;
-                        try { liveAudioEl.load(); } catch {}
-                        const container = document.getElementById('liveAudioContainer');
-                        if (container) container.classList.remove('hidden');
-                        liveAudioEl.classList.remove('hidden');
-            // Show the streaming panel with the ready audio element
-            setStreamVisible(true);
-            setStreamStatus('Ready');
-                    } catch (e) {
-                        console.log('Could not set audio URL on element:', e);
-                    }
-                }
+    // No HTML audio element to set when using HTTP fallback
                 
             } else {
                 showError(data.message || 'Failed to process audio');

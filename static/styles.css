@@ -20,6 +20,78 @@ body {
     box-sizing: border-box;
 }
 
+/* App layout with sidebar */
+.app-layout {
+    max-width: 1200px;
+}
+
+.content {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    gap: 20px;
+}
+
+.sidebar {
+    background: rgba(18, 18, 36, 0.85);
+    border: 1px solid rgba(102, 126, 234, 0.2);
+    border-radius: 16px;
+    padding: 12px;
+    height: 70vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+}
+
+.sidebar-header {
+    padding-bottom: 8px;
+    border-bottom: 1px dashed rgba(102, 126, 234, 0.2);
+    margin-bottom: 8px;
+}
+
+.new-chat-btn {
+    width: 100%;
+    border: none;
+    border-radius: 10px;
+    padding: 10px 12px;
+    background: linear-gradient(135deg, #667eea, #764ba2);
+    color: #111;
+    font-weight: 700;
+    cursor: pointer;
+}
+
+.sessions-list {
+    margin-top: 8px;
+    overflow-y: auto;
+    padding-right: 6px;
+}
+
+.session-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 10px;
+    margin: 6px 0;
+    border-radius: 10px;
+    background: rgba(255,255,255,0.03);
+    cursor: pointer;
+    transition: background 0.2s ease;
+}
+.session-item:hover { background: rgba(255,255,255,0.08); }
+.session-item.active { border: 1px solid rgba(102, 126, 234, 0.3); }
+.session-title { font-size: 13px; color: #e0e0e0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 180px; }
+
+.delete-btn {
+    opacity: 0;
+    border: none;
+    background: transparent;
+    color: #ff6b6b;
+    font-weight: 800;
+    cursor: pointer;
+}
+.session-item:hover .delete-btn { opacity: 1; }
+
+.main-pane { min-width: 0; }
+
 header {
     text-align: center;
     margin-bottom: 40px;

@@ -9,7 +9,7 @@
     <link rel="stylesheet" href="static/styles.css">
 </head>
 <body>
-    <div class="container">
+    <div class="container app-layout">
         <header>
             <img src="static/logo.jpeg" alt="Murf AI Logo" class="logo">
             <h1>Murf AI</h1>
@@ -17,7 +17,18 @@
             <!-- <p> </p> -->
         </header>
         
-        <main>
+        <div class="content">
+            <!-- Sidebar: ChatGPT-like sessions list -->
+            <aside class="sidebar" id="sidebar">
+                <div class="sidebar-header">
+                    <button id="newChatBtn" class="new-chat-btn" type="button">+ New chat</button>
+                </div>
+                <nav id="sessionsList" class="sessions-list">
+                    <!-- Sessions rendered here -->
+                </nav>
+            </aside>
+
+            <main class="main-pane">
             <div class="voice-agent">
                 <div class="reset-container">
                     <button id="resetBtn" class="reset-button" type="button">
@@ -54,21 +65,7 @@
                 <!-- Chat Container for conversation history -->
                 <div id="chatContainer"></div>
                 
-                <div class="audio-container hidden">
-                    <audio id="audioPlayback" controls></audio>
-                </div>
-                <!-- Day 21: Audio Streaming Panel -->
-                <div id="audioStreamCard" class="stream-card hidden">
-                    <div class="stream-card-header">
-                        <h3>Audio Streaming</h3>
-                        <span id="streamStatus" class="pill pill-waiting">Waiting</span>
-                    </div>
-                    <!-- Removed Chunks and Total (chars) stats -->
-                    <div id="streamChunksList" class="stream-chunks"></div>
-                    <div id="liveAudioContainer" style="margin-top:8px;">
-                        <audio id="liveAudio" controls style="width:100%;"></audio>
-                    </div>
-                </div>
+                
                 <div id="transcribeContainer" class="hidden">
                     <button id="transcribeBtn" type="button" class="hidden-button">Re-process Echo</button>
                     <p id="transcribingStatus" class="hidden">Processing echo...</p>
@@ -91,9 +88,9 @@
                 </div>
             </div>
 
-            
-        </main>
+            </main>
+        </div>
     </div>
-        <script src="/static/script.js?v=3.1.0"></script>
+    <script src="/static/script.js?v=3.2.0"></script>
 </body>
 </html>

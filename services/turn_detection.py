@@ -27,13 +27,14 @@ from assemblyai.streaming.v3 import (
 
 logger = logging.getLogger(__name__)
 MURF_WS_URL = "wss://api.murf.ai/v1/speech/stream-input"
-MURF_KEY = os.getenv("MURF_API_KEY")
 
 class TurnDetectionService:
     """Encapsulates AssemblyAI Universal Streaming turn detection."""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
+        # Read Murf key at runtime to reflect current env
+        self.murf_key = (os.getenv("MURF_API_KEY") or "").strip('\"\'')
 
     def create_client(self) -> StreamingClient:
         return StreamingClient(
@@ -165,10 +166,10 @@ class TurnDetectionService:
         client = self.create_client()
 
         async def murf_ws_worker(static_ctx: str):
-            if not MURF_KEY:
+            if not self.murf_key:
                 logger.warning("[TurnDetection] MURF_API_KEY missing; skipping Murf WS TTS")
                 return
-            qs = f"?api-key={MURF_KEY.strip('\"\'')}\u0026sample_rate=44100\u0026channel_type=MONO\u0026format=WAV"
+            qs = f"?api-key={self.murf_key}\u0026sample_rate=44100\u0026channel_type=MONO\u0026format=WAV"
             url = f"{MURF_WS_URL}{qs}"
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=10) as ws:
@@ -184,7 +185,6 @@ class TurnDetectionService:
                     await ws.send(json.dumps(voice_cfg))
 
                     async def receiver():
-                        print("\n--- Murf WS audio stream (base64) ---")
                         try:
                             while True:
                                 raw = await ws.recv()
@@ -195,7 +195,6 @@ class TurnDetectionService:
                                     continue
                                 if isinstance(data, dict):
                                     if "audio" in data:
-                                        print(data["audio"])  # base64
                                         try:
                                             await send_queue.put({
                                                 "type": "audio_chunk",
@@ -214,7 +213,7 @@ class TurnDetectionService:
                                             pass
                                         break
                         finally:
-                            print("--- Murf WS audio stream end ---\n")
+                            pass
 
                     recv_task = asyncio.create_task(receiver())
                     while True:
@@ -240,24 +239,70 @@ class TurnDetectionService:
                 logger.info("[TurnDetection] LLM streaming input text: %s", text[:300])
                 model = genai.GenerativeModel('gemini-1.5-flash')
                 stream = model.generate_content(prompt, stream=True)
-                print("\n=== Streaming LLM response (Gemini) ===")
+        # Streaming LLM response (Gemini) started
+                started = False
+                accum_parts = []
                 for chunk in stream:
                     part = getattr(chunk, 'text', '') or ''
                     if part:
-                        print(part, end='', flush=True)
+            # Do not print to terminal; stream to client and TTS
+                        accum_parts.append(part)
+                        # Notify client of stream start once
+                        if not started:
+                            started = True
+                            try:
+                                asyncio.run_coroutine_threadsafe(
+                                    send_queue.put({
+                                        "type": "assistant_stream_start",
+                                        "session_id": session_id,
+                                        "tts_unavailable": False if self.murf_key else True,
+                                    }),
+                                    loop,
+                                )
+                            except Exception:
+                                pass
+                        # Send delta to client for live rendering
                         try:
-                            asyncio.run_coroutine_threadsafe(murf_queue.put({"text": part}), loop)
+                            asyncio.run_coroutine_threadsafe(
+                                send_queue.put({
+                                    "type": "assistant_delta",
+                                    "text": part,
+                                    "session_id": session_id,
+                                }),
+                                loop,
+                            )
                         except Exception as fe:
-                            logger.debug(f"[TurnDetection] could not enqueue Murf text: {fe}")
-                print("\n=== End of LLM stream ===\n")
+                            logger.debug(f"[TurnDetection] could not enqueue assistant delta: {fe}")
+                        # Forward to TTS if configured
+                        if self.murf_key:
+                            try:
+                                asyncio.run_coroutine_threadsafe(murf_queue.put({"text": part}), loop)
+                            except Exception as fe:
+                                logger.debug(f"[TurnDetection] could not enqueue Murf text: {fe}")
+                # Streaming LLM response (Gemini) ended
                 try:
                     stream.resolve()
                 except Exception:
                     pass
+                # Send stream end + final text to client
+                full_text = ''.join(accum_parts).strip()
                 try:
-                    asyncio.run_coroutine_threadsafe(murf_queue.put({"end": True}), loop)
+                    asyncio.run_coroutine_threadsafe(
+                        send_queue.put({
+                            "type": "assistant_final",
+                            "text": full_text,
+                            "session_id": session_id,
+                        }),
+                        loop,
+                    )
                 except Exception:
                     pass
+                # Signal TTS end if used
+                if self.murf_key:
+                    try:
+                        asyncio.run_coroutine_threadsafe(murf_queue.put({"end": True}), loop)
+                    except Exception:
+                        pass
             except Exception as e:
                 logger.exception(f"[TurnDetection] LLM streaming error: {e}")
 
@@ -387,8 +432,7 @@ class TurnDetectionService:
                         await websocket.send_text(json.dumps(payload))
                     except Exception:
                         break
-                    if payload.get("type") == "audio_stream_end":
-                        break
+                    # Keep the WS open across turns; do not break on audio_stream_end
                 except asyncio.TimeoutError:
                     continue
 
