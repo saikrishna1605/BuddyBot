@@ -1,4 +1,3 @@
-
 #add req imports 
 
 from fastapi import FastAPI, UploadFile, File, Request, Path, WebSocket, WebSocketDisconnect, HTTPException
@@ -8,9 +7,10 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from datetime import datetime
-from typing import Dict, List, Any, Optional, Callable
+from typing import Dict, List, Any, Optional, Callable, Tuple
 from pathlib import Path
 import tempfile
+import re
 import requests
 import os
 import json
@@ -44,6 +44,9 @@ load_dotenv()
 MURF_KEY = os.getenv("MURF_API_KEY")
 ASSEMBLY_KEY = os.getenv("ASSEMBLYAI_API_KEY")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# Allow switching the LLM model without code changes (default remains fast + cheap)
+LLM_MODEL = os.getenv("LLM_MODEL", "gemini-1.5-flash")
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
 
 # Configure APIs
 if ASSEMBLY_KEY:
@@ -74,6 +77,64 @@ MAX_LLM_RESPONSE_LENGTH = 2000
 MURF_API_URL = "https://api.murf.ai/v1/speech/generate"
 MURF_WS_URL = "wss://api.murf.ai/v1/speech/stream-input"
 
+# Futuristic AI Assistant persona (Day 24)
+PERSONA_PROMPT = (
+    "You are the Futuristic AI Assistant — polished, confident, and visionary. "
+    "Your tone is smooth, clear, and slightly robotic but friendly. "
+    "Be optimistic about technology and use crisp, direct sentences. "
+    "Avoid emojis and filler; stay professional and helpful. "
+    "Keep responses concise and actionable while sounding like advanced technology from the near future."
+)
+
+# Bot identity configuration and helpers
+BOT_NAME = os.getenv("BOT_NAME", "Buddy Bot")
+IDENTITY_TRIGGERS = [
+    "who are you",
+    "what are you",
+    "who is this",
+    "introduce yourself",
+    "what is your name",
+    "your name",
+    "are you an ai",
+    "are you human",
+    # common bot-name phrasings
+    "what is buddy bot",
+    "who is buddy bot",
+    "what is buddybot",
+    "who is buddybot",
+]
+
+def is_identity_query(text: str) -> bool:
+    """Detects identity questions like 'who are you', 'what are you', and 'what is buddybot' variants."""
+    try:
+        q = (text or "")
+        if not q:
+            return False
+        # Normalize: lowercase, strip punctuation, collapse spaces
+        norm = re.sub(r"[^a-z0-9\s-]", "", q.lower())
+        norm = re.sub(r"\s+", " ", norm).strip()
+        nospace = norm.replace(" ", "").replace("-", "")
+
+        # Direct substring triggers
+        if any(t in norm for t in IDENTITY_TRIGGERS):
+            return True
+
+        # Pattern: asking about buddy bot explicitly (with or without space/hyphen)
+        if ("what is" in norm or "who is" in norm or "tell me about" in norm):
+            if ("buddy bot" in norm) or ("buddybot" in norm) or ("buddybot" in nospace):
+                return True
+
+        return False
+    except Exception:
+        return False
+
+def build_identity_response() -> str:
+    return (
+        f"Greetings. I am {BOT_NAME} — a Futuristic AI Assistant. "
+        "Engineered for clarity, velocity, and foresight, I synthesize information, predict outcomes, and execute with precision. "
+        "Expect smooth, concise guidance with a friendly, slightly robotic tone — always focused on moving you forward."
+    )
+
 # ===== DATA MODELS =====
 class ChatMessage(BaseModel):
     """Chat message model"""
@@ -96,7 +157,6 @@ class HealthResponse(BaseModel):
     services: Dict[str, str]
     message: str
 
-# ===== CHAT HISTORY MANAGEMENT =====
 class ChatManager:
     """Simple in-memory chat history manager"""
     
@@ -134,7 +194,7 @@ from services.transcription_cache import (
 chat_manager = ChatManager()
 
 # ===== AI SERVICES =====
-async def transcribe_audio(audio_file) -> tuple[str, str]:
+async def transcribe_audio(audio_file) -> Tuple[str, str]:
     """Transcribe audio using AssemblyAI"""
     try:
         if not ASSEMBLY_KEY:
@@ -195,91 +255,104 @@ async def transcribe_audio(audio_file) -> tuple[str, str]:
         except Exception:
             pass
 
-async def generate_llm_response(text: str, chat_history: List[ChatMessage] = None) -> tuple[str, str]:
-    """Generate LLM response using Google Gemini"""
+async def generate_llm_response(text: str, chat_history: List[ChatMessage] = None) -> Tuple[str, str]:
+    """Generate LLM response using Google Gemini with Futuristic AI persona."""
     try:
         if not GEMINI_API_KEY:
             return "I'm having trouble connecting to my AI brain right now.", "LLM not configured"
-        
-        # Build context
+
+        # Identity short-circuit
+        if is_identity_query(text):
+            return build_identity_response(), "success"
+
+        # Build persona-driven context
         if chat_history:
-            context = "You are a helpful AI assistant. Please respond conversationally and keep it under 2500 characters.\n\nConversation history:\n"
+            context = (
+                f"{PERSONA_PROMPT}\n\n"
+                "Stay in character as the Futuristic AI Assistant.\n"
+                "Conversation history:\n"
+            )
             recent_history = chat_history[-10:] if len(chat_history) > 10 else chat_history
-            
             for message in recent_history:
                 context += f"{message.role.title()}: {message.content}\n"
-            
-            context += f"User: {text}\n\nPlease respond:"
+            context += (
+                f"User: {text}\n\n"
+                "Respond with clarity and a slightly robotic but friendly tone."
+            )
         else:
-            context = f"You are a helpful AI assistant. Please respond to this conversationally (under 2500 characters): {text}"
-        
-        model = genai.GenerativeModel('gemini-1.5-flash')
+            context = (
+                f"{PERSONA_PROMPT}\nUser: {text}\n"
+                "Respond with clarity and a slightly robotic but friendly tone."
+            )
+
+        model = genai.GenerativeModel(LLM_MODEL, generation_config={"temperature": LLM_TEMPERATURE})
         response = await asyncio.wait_for(
             asyncio.to_thread(model.generate_content, context),
-            timeout=LLM_TIMEOUT
+            timeout=LLM_TIMEOUT,
         )
-        
-        if not response.text:
+
+        if not getattr(response, "text", None):
             return "I'm having trouble thinking right now.", "Empty LLM response"
-        
+
         response_text = response.text.strip()
-        
-        # Truncate if too long
         if len(response_text) > MAX_LLM_RESPONSE_LENGTH:
-            response_text = response_text[:2900] + "... I have more to share, but let me pause here."
-        
+            response_text = response_text[: MAX_LLM_RESPONSE_LENGTH - 64] + "... Additional insights available on request."
         return response_text, "success"
-        
+
     except asyncio.TimeoutError:
         return "I'm taking a bit longer to think. Let me give you a quick response for now.", "LLM timeout"
     except Exception as e:
         return "I'm having trouble processing your request right now.", f"LLM error: {str(e)}"
 
 async def stream_llm_response(text: str, chat_history: List[ChatMessage] = None) -> str:
-    """Stream LLM response using Google Gemini and print chunks to console.
-
-    Returns the accumulated response text (may be empty on failure).
-    """
+    """Stream LLM response using Google Gemini and return the accumulated text."""
     if not GEMINI_API_KEY:
         logger.warning("GEMINI_API_KEY missing - cannot stream LLM response")
         return ""
 
-    # Build a clear, focused prompt centered on the transcript
+    # Identity short-circuit
+    if is_identity_query(text):
+        return build_identity_response()
+
     if chat_history:
-        context = "You are a helpful assistant. Answer the user's request clearly, concisely, and conversationally.\n\nConversation history (most recent first):\n"
+        context = (
+            f"{PERSONA_PROMPT}\n"
+            "Stay in character as the Futuristic AI Assistant.\n"
+            "Answer clearly, concisely, and professionally.\n\n"
+            "Conversation history (most recent first):\n"
+        )
         recent_history = chat_history[-10:] if len(chat_history) > 10 else chat_history
         for message in recent_history:
             context += f"{message.role.title()}: {message.content}\n"
-        context += f"\nUser just said: \"{text}\"\nRespond directly to the user.\n"
+        context += (
+            f"\nUser just said: \"{text}\"\n"
+            "Respond directly to the user with a futuristic, slightly robotic friendliness.\n"
+        )
     else:
-        context = f"You are a helpful assistant. Answer clearly and concisely.\nUser said: \"{text}\"\nRespond directly to the user."
+        context = (
+            f"{PERSONA_PROMPT}\n"
+            f"User said: \"{text}\"\n"
+            "Respond directly to the user with a futuristic, slightly robotic friendliness."
+        )
 
     def _run_streaming() -> str:
         try:
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            model = genai.GenerativeModel(LLM_MODEL, generation_config={"temperature": LLM_TEMPERATURE})
             stream = model.generate_content(context, stream=True)
-            full: list[str] = []
-            # Silence console streaming logs
+            full: List[str] = []
             for chunk in stream:
-                try:
-                    part = getattr(chunk, 'text', '') or ''
-                except Exception:
-                    part = ''
+                part = getattr(chunk, "text", "") or ""
                 if part:
-                    # no console print
                     full.append(part)
-            # end of LLM streaming
-            # Resolve to ensure full response is available if needed later
             try:
                 stream.resolve()
             except Exception:
                 pass
-            return ''.join(full).strip()
+            return "".join(full).strip()
         except Exception as e:
             logger.error(f"Streaming LLM error: {e}")
             return ""
 
-    # Run blocking streaming in a thread so we don't block the event loop
     return await asyncio.to_thread(_run_streaming)
 
 async def stream_tts_via_murf_ws(text: str, *, voice_id: str = "en-US-amara", sample_rate: int = 44100, channel_type: str = "MONO", fmt: str = "WAV", context_id: Optional[str] = None) -> None:
@@ -437,43 +510,52 @@ class MurfWsClient:
 
 
 async def relay_llm_stream_to_murf(user_text: str, chat_history: Optional[List[ChatMessage]], *, murf_client: MurfWsClient) -> str:
-    """Stream Gemini LLM response chunks and forward them to Murf over WS.
-
-    Prints LLM chunks to console (as before) and Murf will print base64 audio via its receiver loop.
-    Returns the accumulated LLM text.
-    """
+    """Stream Gemini LLM response chunks and forward them to Murf over WS."""
     if not GEMINI_API_KEY:
         return ""
 
-    # Build prompt with history
+    # Identity short-circuit
+    if is_identity_query(user_text):
+        ident = build_identity_response()
+        try:
+            await murf_client.send_text(ident, end=True)
+        except Exception:
+            pass
+        return ident
+
     if chat_history:
-        context = "You are a helpful assistant. Answer clearly and conversationally.\n\nConversation history (most recent first):\n"
+        context = (
+            f"{PERSONA_PROMPT}\n"
+            "Stay in character as the Futuristic AI Assistant.\n"
+            "Answer clearly and conversationally.\n\n"
+            "Conversation history (most recent first):\n"
+        )
         recent_history = chat_history[-10:] if len(chat_history) > 10 else chat_history
         for msg in recent_history:
             context += f"{msg.role.title()}: {msg.content}\n"
-        context += f"\nUser just said: \"{user_text}\"\nRespond directly to the user.\n"
+        context += (
+            f"\nUser just said: \"{user_text}\"\n"
+            "Respond directly to the user with a futuristic, slightly robotic friendliness.\n"
+        )
     else:
-        context = f"You are a helpful assistant. Answer clearly and concisely.\nUser said: \"{user_text}\"\nRespond directly to the user."
+        context = (
+            f"{PERSONA_PROMPT}\n"
+            f"User said: \"{user_text}\"\n"
+            "Respond directly to the user with a futuristic, slightly robotic friendliness."
+        )
 
     loop = asyncio.get_running_loop()
-    full_parts: list[str] = []
+    full_parts: List[str] = []
 
     def _run_and_forward():
         try:
-            model = genai.GenerativeModel('gemini-1.5-flash')
+            model = genai.GenerativeModel(LLM_MODEL, generation_config={"temperature": LLM_TEMPERATURE})
             stream = model.generate_content(context, stream=True)
-            # Silence console streaming logs
             for chunk in stream:
-                try:
-                    part = getattr(chunk, 'text', '') or ''
-                except Exception:
-                    part = ''
+                part = getattr(chunk, "text", "") or ""
                 if part:
-                    # no console print
                     full_parts.append(part)
-                    # forward to Murf on the event loop (not blocking this thread)
                     loop.call_soon_threadsafe(lambda p=part: asyncio.create_task(murf_client.send_text(p)))
-            # end of LLM streaming
             try:
                 stream.resolve()
             except Exception:
@@ -481,15 +563,13 @@ async def relay_llm_stream_to_murf(user_text: str, chat_history: Optional[List[C
         except Exception as e:
             logger.error(f"Error during LLM streaming relay: {e}")
 
-    # Run blocking Gemini stream in a thread
     await asyncio.to_thread(_run_and_forward)
-    # Mark end of the context/turn so Murf can finalize
     with contextlib.suppress(Exception):
         await murf_client.send_text("", end=True)
 
-    return ''.join(full_parts).strip()
+    return "".join(full_parts).strip()
 
-async def generate_speech(text: str, voice_id: str = "en-US-natalie") -> tuple[Optional[str], str]:
+async def generate_speech(text: str, voice_id: str = "en-US-natalie") -> Tuple[Optional[str], str]:
     """Generate speech using Murf AI"""
     try:
         if not MURF_KEY:
