@@ -351,6 +351,76 @@ main {
     animation: recordingPulse 1.5s infinite;
 }
 
+/* Search toggle styles (dark theme) */
+.search-toggle {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    z-index: 12;
+}
+.search-toggle .search-label {
+    color: #d1d5db;
+    font-weight: 700;
+    font-size: 12px;
+    letter-spacing: 0.4px;
+}
+.switch {
+    position: relative;
+    display: inline-block;
+    width: 52px;
+    height: 28px;
+}
+.switch input { display:none; }
+.slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: linear-gradient(135deg, rgba(255,255,255,0.06), rgba(255,255,255,0.03));
+    border-radius: 999px;
+    border: 1px solid rgba(255,255,255,0.04);
+    box-shadow: inset 0 1px 0 rgba(255,255,255,0.02);
+    transition: all 0.25s ease;
+}
+.slider:before {
+    content: '';
+    position: absolute;
+    height: 22px;
+    width: 22px;
+    left: 3px;
+    top: 3px;
+    /* Default knob: bright white for CRT look */
+    background: linear-gradient(180deg, #ffffff, #f3f4f6);
+    border-radius: 50%;
+    /* soft outer glow and subtle inner sheen for CRT feel */
+    box-shadow: 0 6px 16px rgba(255,255,255,0.06), 0 2px 6px rgba(0,0,0,0.6) inset;
+    border: 1px solid rgba(0,0,0,0.25);
+    transition: transform 0.25s cubic-bezier(.2,.9,.2,1), background 0.25s, box-shadow 0.25s;
+}
+.switch input:checked + .slider {
+    background: linear-gradient(90deg, rgba(102,126,234,0.18), rgba(16,185,129,0.18));
+    border-color: rgba(102,126,234,0.3);
+}
+.switch input:checked + .slider:before {
+    transform: translateX(24px);
+    background: linear-gradient(180deg, #10b981, #059669);
+    box-shadow: 0 8px 20px rgba(16,185,129,0.18), 0 2px 6px rgba(0,0,0,0.6) inset;
+}
+
+/* Sources panel dark cards */
+#sourcesContainer { margin-top:12px; border-top:1px solid rgba(255,255,255,0.04); padding-top:12px; }
+.source-list { display: grid; grid-template-columns: 1fr; gap:10px; }
+.source-card {
+    background: linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));
+    border: 1px solid rgba(255,255,255,0.04);
+    padding: 12px;
+    border-radius: 12px;
+}
+.source-card a { color: #93c5fd; font-weight:700; text-decoration:none; }
+.source-card p { color: #cbd5e1; font-size:13px; margin-top:6px; }
+
 .record-text {
     color: white;
     font-size: 1.1rem;

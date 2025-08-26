@@ -37,6 +37,13 @@
                 </div>
                 <h1>AI Voice Agent</h1>
                 <div class="main-controls" style="position: relative; display: flex; justify-content: center; align-items: center; margin-bottom: 24px; min-height: 300px;">
+                    <div id="searchToggle" class="search-toggle">
+                        <label class="switch">
+                            <input type="checkbox" id="toggleSearch" />
+                            <span class="slider"></span>
+                        </label>
+                        <span class="search-label">Search</span>
+                    </div>
                     <div class="particle"></div>
                     <div class="particle"></div>
                     <div class="particle"></div>
@@ -64,6 +71,8 @@
                 
                 <!-- Chat Container for conversation history -->
                 <div id="chatContainer"></div>
+                <!-- Sources (Perplexity-like) -->
+                <div id="sourcesContainer" class="hidden" style="margin-top:12px; border-top:1px solid #eee; padding-top:10px;"></div>
                 
                 
                 <div id="transcribeContainer" class="hidden">

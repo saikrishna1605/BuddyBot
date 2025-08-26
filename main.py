@@ -34,6 +34,7 @@ from assemblyai.streaming.v3 import (
 )
 import google.generativeai as genai
 from services.turn_detection import TurnDetectionService
+from services.skills import handle_weather_query
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -265,6 +266,14 @@ async def generate_llm_response(text: str, chat_history: List[ChatMessage] = Non
         if is_identity_query(text):
             return build_identity_response(), "success"
 
+        # Special skill: Weather
+        try:
+            wx = await handle_weather_query(text)
+            if wx:
+                return wx, "success"
+        except Exception as _e:
+            pass
+
         # Build persona-driven context
         if chat_history:
             context = (
@@ -313,6 +322,14 @@ async def stream_llm_response(text: str, chat_history: List[ChatMessage] = None)
     # Identity short-circuit
     if is_identity_query(text):
         return build_identity_response()
+
+    # Special skill: Weather (non-streaming shortcut)
+    try:
+        wx = await handle_weather_query(text)
+        if wx:
+            return wx
+    except Exception:
+        pass
 
     if chat_history:
         context = (
@@ -522,6 +539,18 @@ async def relay_llm_stream_to_murf(user_text: str, chat_history: Optional[List[C
         except Exception:
             pass
         return ident
+
+    # Special skill: Weather
+    try:
+        wx = await handle_weather_query(user_text)
+        if wx:
+            try:
+                await murf_client.send_text(wx, end=True)
+            except Exception:
+                pass
+            return wx
+    except Exception:
+        pass
 
     if chat_history:
         context = (
@@ -970,6 +999,24 @@ async def health_check():
         message = "All services unavailable"
     
     return HealthResponse(status=overall_status, services=services, message=message)
+
+@app.get("/skill/weather")
+async def skill_weather(q: str):
+    """HTTP access to the weather skill. Example: /skill/weather?q=weather%20in%20Paris"""
+    try:
+        ans = await handle_weather_query(q)
+        if not ans:
+            # If user passed just a city without saying 'weather', try fetching directly
+            from services.skills import fetch_weather, format_weather_response
+            data, err = await fetch_weather(q)
+            if err:
+                return {"ok": False, "error": err}
+            if not data:
+                return {"ok": False, "error": "No data"}
+            return {"ok": True, "applies": True, "response": format_weather_response(data)}
+        return {"ok": True, "applies": True, "response": ans}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/agent/chat/{session_id}", response_model=ConversationResponse)
 async def conversation_pipeline(session_id: str, file: UploadFile = File(...)):

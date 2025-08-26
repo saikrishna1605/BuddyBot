@@ -8,10 +8,12 @@ document.addEventListener('DOMContentLoaded', function() {
     const recordingIndicator = document.getElementById('recordingIndicator');
     const processingIndicator = document.getElementById('processingIndicator');
     const chatContainer = document.getElementById('chatContainer');
+    const sourcesContainer = document.getElementById('sourcesContainer');
     const error = document.getElementById('error');
     // Sidebar elements
     const newChatBtn = document.getElementById('newChatBtn');
     const sessionsList = document.getElementById('sessionsList');
+    const toggleSearchEl = document.getElementById('toggleSearch');
     
     let mediaRecorder;
     let audioChunks = [];
@@ -165,6 +167,7 @@ document.addEventListener('DOMContentLoaded', function() {
     function displayChatHistory(sessionId) {
         const history = loadChatHistory(sessionId);
         chatContainer.innerHTML = '';
+    if (sourcesContainer) sourcesContainer.classList.add('hidden'); sourcesContainer.innerHTML = '';
         
         history.forEach(msg => {
             const messageDiv = document.createElement('div');
@@ -511,6 +514,23 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         });
     }
+    // Search toggle controls (enhanced UI)
+    if (toggleSearchEl) {
+        // set accessible label
+        toggleSearchEl.setAttribute('aria-label', 'Toggle web search mode');
+        toggleSearchEl.addEventListener('change', () => {
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.send(toggleSearchEl.checked ? 'search_on' : 'search_off');
+            }
+            // Visual hint: add small pulse to indicate active
+            const wrapper = document.getElementById('searchToggle');
+            if (wrapper) {
+                wrapper.classList.remove('search-active');
+                void wrapper.offsetWidth;
+                if (toggleSearchEl.checked) wrapper.classList.add('search-active');
+            }
+        });
+    }
     
     // Reset button functionality
     if (resetBtn) {
@@ -680,6 +700,35 @@ document.addEventListener('DOMContentLoaded', function() {
                             // Do NOT close the WebSocket here; keep it open to receive audio chunks
                             // The server will send 'audio_stream_end' when TTS streaming completes
                             break;
+                        case 'mode':
+                            if (toggleSearchEl) toggleSearchEl.checked = !!data.search;
+                            break;
+                        case 'sources':
+                            try {
+                                if (!sourcesContainer) break;
+                                const items = Array.isArray(data.items) ? data.items : [];
+                                if (!items.length) break;
+                                sourcesContainer.innerHTML = '';
+                                const title = document.createElement('div');
+                                title.textContent = 'Sources';
+                                title.className = 'stream-card-header';
+                                sourcesContainer.appendChild(title);
+                                const list = document.createElement('div');
+                                list.className = 'source-list';
+                                items.forEach((s, i) => {
+                                    const card = document.createElement('div');
+                                    card.className = 'source-card';
+                                    const a = document.createElement('a');
+                                    a.href = s.url || '#'; a.target = '_blank'; a.rel = 'noopener noreferrer';
+                                    a.textContent = s.title || s.url || `Source ${i+1}`;
+                                    const snip = document.createElement('p');
+                                    snip.textContent = s.snippet || '';
+                                    card.appendChild(a); card.appendChild(snip); list.appendChild(card);
+                                });
+                                sourcesContainer.appendChild(list);
+                                sourcesContainer.classList.remove('hidden');
+                            } catch (e) { console.debug('sources render error', e); }
+                            break;
                             
                         case 'transcription_error':
                             console.error('❌ Transcription error:', data.message);
@@ -712,6 +761,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     fallbackCheckInterval = null;
                 }
                 streamAnnounced = false;
+                if (sourcesContainer) { sourcesContainer.classList.add('hidden'); sourcesContainer.innerHTML = ''; }
                 
                 // If no final transcript exists, start fallback polling
                 const alreadyRendered = document.querySelector(`.final-transcript[data-session-id="${currentSessionId}"]`);

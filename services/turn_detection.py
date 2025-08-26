@@ -13,6 +13,8 @@ import websockets
 import google.generativeai as genai
 from starlette.websockets import WebSocketDisconnect
 from services.transcription_cache import add_transcription_to_cache
+from services.skills import handle_weather_query
+from services.search import web_search, format_search_summary, speechify_summary
 
 from assemblyai.streaming.v3 import (
     BeginEvent,
@@ -154,7 +156,7 @@ class TurnDetectionService:
         client.on(StreamingEvents.Error, on_error)
 
     async def stream_handler(self, websocket, api_key: str):
-        """Turn detection WS with pause/resume, fallback finalization, and LLM→Murf streaming."""
+        """Turn detection WS with pause/resume, search toggle, memory, and LLM→Murf streaming."""
         await websocket.accept()
         session_id = f"turn_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         loop = asyncio.get_running_loop()
@@ -162,6 +164,8 @@ class TurnDetectionService:
         murf_queue: asyncio.Queue = asyncio.Queue()
         murf_future: Optional[concurrent.futures.Future] = None
         paused: bool = False
+        use_search: bool = False
+        memory: list = []
 
         client = self.create_client()
 
@@ -173,17 +177,8 @@ class TurnDetectionService:
             url = f"{MURF_WS_URL}{qs}"
             try:
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20, close_timeout=10) as ws:
-                    voice_cfg = {
-                        "voice_config": {
-                            "voiceId": "en-US-amara",
-                            "style": "Conversational",
-                            "rate": 0,
-                            "pitch": 0,
-                            "variation": 1,
-                        }
-                    }
+                    voice_cfg = {"voice_config": {"voiceId": "en-US-amara", "style": "Conversational", "rate": 0, "pitch": 0, "variation": 1}}
                     await ws.send(json.dumps(voice_cfg))
-
                     async def receiver():
                         try:
                             while True:
@@ -191,30 +186,15 @@ class TurnDetectionService:
                                 try:
                                     data = json.loads(raw)
                                 except Exception:
-                                    logger.debug(f"[TurnDetection] Murf WS non-JSON: {raw}")
                                     continue
                                 if isinstance(data, dict):
                                     if "audio" in data:
-                                        try:
-                                            await send_queue.put({
-                                                "type": "audio_chunk",
-                                                "data": data["audio"],
-                                                "session_id": session_id,
-                                            })
-                                        except Exception as fe:
-                                            logger.debug(f"[TurnDetection] enqueue audio_chunk failed: {fe}")
+                                        await send_queue.put({"type": "audio_chunk", "data": data["audio"], "session_id": session_id})
                                     if data.get("final"):
-                                        try:
-                                            await send_queue.put({
-                                                "type": "audio_stream_end",
-                                                "session_id": session_id,
-                                            })
-                                        except Exception:
-                                            pass
+                                        await send_queue.put({"type": "audio_stream_end", "session_id": session_id})
                                         break
                         finally:
-                            pass
-
+                            return
                     recv_task = asyncio.create_task(receiver())
                     while True:
                         item = await murf_queue.get()
@@ -232,77 +212,99 @@ class TurnDetectionService:
             try:
                 if not text or not text.strip():
                     return
-                prompt = (
-                    "You are a helpful assistant. Answer the user's request clearly, concisely, and conversationally.\n"
-                    f"User said: \"{text}\"\nRespond directly to the user."
-                )
-                logger.info("[TurnDetection] LLM streaming input text: %s", text[:300])
+                # Update memory with user message
+                try:
+                    memory.append({"role": "user", "content": text})
+                    if len(memory) > 16:
+                        del memory[0:len(memory)-16]
+                except Exception:
+                    pass
+                # Weather skill
+                try:
+                    wx = asyncio.run(handle_weather_query(text))
+                except RuntimeError:
+                    loop2 = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop2)
+                    wx = loop2.run_until_complete(handle_weather_query(text))
+                    loop2.close()
+                except Exception:
+                    wx = None
+                if wx:
+                    asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_stream_start", "session_id": session_id, "tts_unavailable": False if self.murf_key else True}), loop)
+                    asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_delta", "text": wx, "session_id": session_id}), loop)
+                    if self.murf_key:
+                        asyncio.run_coroutine_threadsafe(murf_queue.put({"text": wx}), loop)
+                        asyncio.run_coroutine_threadsafe(murf_queue.put({"end": True}), loop)
+                    asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_final", "text": wx, "session_id": session_id}), loop)
+                    return
+                # Search mode
+                if use_search:
+                    try:
+                        try:
+                            data, err = asyncio.run(web_search(text))
+                        except RuntimeError:
+                            loop2 = asyncio.new_event_loop()
+                            asyncio.set_event_loop(loop2)
+                            data, err = loop2.run_until_complete(web_search(text))
+                            loop2.close()
+                        if not err and data:
+                            answer, sources = format_search_summary(data)
+                            asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_stream_start", "session_id": session_id, "tts_unavailable": False if self.murf_key else True, "mode": "search"}), loop)
+                            speech = speechify_summary(answer)
+                            asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_delta", "text": speech, "session_id": session_id}), loop)
+                            if self.murf_key:
+                                asyncio.run_coroutine_threadsafe(murf_queue.put({"text": speech}), loop)
+                                asyncio.run_coroutine_threadsafe(murf_queue.put({"end": True}), loop)
+                            asyncio.run_coroutine_threadsafe(send_queue.put({"type": "sources", "session_id": session_id, "items": sources}), loop)
+                            asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_final", "text": answer, "session_id": session_id}), loop)
+                            try:
+                                memory.append({"role": "assistant", "content": answer})
+                                if len(memory) > 16:
+                                    del memory[0:len(memory)-16]
+                            except Exception:
+                                pass
+                            return
+                    except Exception:
+                        pass
+                # Normal LLM
+                prompt = "You are a helpful assistant. Answer the user's request clearly, concisely, and conversationally.\n"
+                try:
+                    if memory:
+                        prompt += "Conversation so far (most recent last):\n"
+                        for m in memory[-8:]:
+                            prompt += f"{m.get('role','user').title()}: {m.get('content','')}\n"
+                    prompt += f"User: {text}\nRespond directly to the user."
+                except Exception:
+                    prompt += f"User: {text}\nRespond directly to the user."
                 model = genai.GenerativeModel('gemini-1.5-flash')
                 stream = model.generate_content(prompt, stream=True)
-        # Streaming LLM response (Gemini) started
                 started = False
                 accum_parts = []
                 for chunk in stream:
                     part = getattr(chunk, 'text', '') or ''
                     if part:
-            # Do not print to terminal; stream to client and TTS
                         accum_parts.append(part)
-                        # Notify client of stream start once
                         if not started:
                             started = True
-                            try:
-                                asyncio.run_coroutine_threadsafe(
-                                    send_queue.put({
-                                        "type": "assistant_stream_start",
-                                        "session_id": session_id,
-                                        "tts_unavailable": False if self.murf_key else True,
-                                    }),
-                                    loop,
-                                )
-                            except Exception:
-                                pass
-                        # Send delta to client for live rendering
-                        try:
-                            asyncio.run_coroutine_threadsafe(
-                                send_queue.put({
-                                    "type": "assistant_delta",
-                                    "text": part,
-                                    "session_id": session_id,
-                                }),
-                                loop,
-                            )
-                        except Exception as fe:
-                            logger.debug(f"[TurnDetection] could not enqueue assistant delta: {fe}")
-                        # Forward to TTS if configured
+                            asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_stream_start", "session_id": session_id, "tts_unavailable": False if self.murf_key else True}), loop)
+                        asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_delta", "text": part, "session_id": session_id}), loop)
                         if self.murf_key:
-                            try:
-                                asyncio.run_coroutine_threadsafe(murf_queue.put({"text": part}), loop)
-                            except Exception as fe:
-                                logger.debug(f"[TurnDetection] could not enqueue Murf text: {fe}")
-                # Streaming LLM response (Gemini) ended
+                            asyncio.run_coroutine_threadsafe(murf_queue.put({"text": part}), loop)
                 try:
                     stream.resolve()
                 except Exception:
                     pass
-                # Send stream end + final text to client
                 full_text = ''.join(accum_parts).strip()
+                asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_final", "text": full_text, "session_id": session_id}), loop)
                 try:
-                    asyncio.run_coroutine_threadsafe(
-                        send_queue.put({
-                            "type": "assistant_final",
-                            "text": full_text,
-                            "session_id": session_id,
-                        }),
-                        loop,
-                    )
+                    if full_text:
+                        memory.append({"role": "assistant", "content": full_text})
+                        if len(memory) > 16:
+                            del memory[0:len(memory)-16]
                 except Exception:
                     pass
-                # Signal TTS end if used
                 if self.murf_key:
-                    try:
-                        asyncio.run_coroutine_threadsafe(murf_queue.put({"end": True}), loop)
-                    except Exception:
-                        pass
+                    asyncio.run_coroutine_threadsafe(murf_queue.put({"end": True}), loop)
             except Exception as e:
                 logger.exception(f"[TurnDetection] LLM streaming error: {e}")
 
@@ -320,14 +322,10 @@ class TurnDetectionService:
         self.wire_handlers(client, loop, session_id, send_queue, on_final, state)
         self.connect(client)
 
-        await websocket.send_text(json.dumps({
-            "type": "connection_established",
-            "message": "Turn detection ready",
-            "session_id": session_id,
-        }))
+        await websocket.send_text(json.dumps({"type": "connection_established", "message": "Turn detection ready", "session_id": session_id}))
 
         async def recv_audio():
-            nonlocal paused
+            nonlocal paused, use_search
             while True:
                 try:
                     msg = await websocket.receive()
@@ -335,50 +333,17 @@ class TurnDetectionService:
                     try:
                         if not state.get("got_final") and state.get("latest_partial"):
                             final_text = state["latest_partial"]
-                            # Save fallback final to cache
                             try:
                                 add_transcription_to_cache(final_text, session_id)
                             except Exception:
                                 pass
-                            await send_queue.put({
-                                "type": "final_transcript",
-                                "text": final_text,
-                                "session_id": session_id,
-                                "turn_order": 1,
-                                "is_formatted": False,
-                            })
-                            await send_queue.put({
-                                "type": "turn_end",
-                                "session_id": session_id,
-                                "turn_order": 1,
-                            })
+                            await send_queue.put({"type": "final_transcript", "text": final_text, "session_id": session_id, "turn_order": 1, "is_formatted": False})
+                            await send_queue.put({"type": "turn_end", "session_id": session_id, "turn_order": 1})
                             on_final(final_text)
                     except Exception:
                         pass
                     break
                 except RuntimeError:
-                    try:
-                        if not state.get("got_final") and state.get("latest_partial"):
-                            final_text = state["latest_partial"]
-                            try:
-                                add_transcription_to_cache(final_text, session_id)
-                            except Exception:
-                                pass
-                            await send_queue.put({
-                                "type": "final_transcript",
-                                "text": final_text,
-                                "session_id": session_id,
-                                "turn_order": 1,
-                                "is_formatted": False,
-                            })
-                            await send_queue.put({
-                                "type": "turn_end",
-                                "session_id": session_id,
-                                "turn_order": 1,
-                            })
-                            on_final(final_text)
-                    except Exception:
-                        pass
                     break
                 if "bytes" in msg:
                     if not paused:
@@ -395,34 +360,21 @@ class TurnDetectionService:
                                 add_transcription_to_cache(final_text, session_id)
                             except Exception:
                                 pass
-                            await send_queue.put({
-                                "type": "final_transcript",
-                                "text": final_text,
-                                "session_id": session_id,
-                                "turn_order": 1,
-                                "is_formatted": False,
-                            })
-                            await send_queue.put({
-                                "type": "turn_end",
-                                "session_id": session_id,
-                                "turn_order": 1,
-                            })
+                            await send_queue.put({"type": "final_transcript", "text": final_text, "session_id": session_id, "turn_order": 1, "is_formatted": False})
+                            await send_queue.put({"type": "turn_end", "session_id": session_id, "turn_order": 1})
                             on_final(final_text)
                     except Exception:
                         pass
                     break
                 elif "text" in msg and msg["text"] in ("pause", "pause_streaming"):
                     paused = True
-                    try:
-                        await send_queue.put({"type": "paused", "session_id": session_id})
-                    except Exception:
-                        pass
+                    await send_queue.put({"type": "paused", "session_id": session_id})
                 elif "text" in msg and msg["text"] in ("resume", "resume_streaming"):
                     paused = False
-                    try:
-                        await send_queue.put({"type": "resumed", "session_id": session_id})
-                    except Exception:
-                        pass
+                    await send_queue.put({"type": "resumed", "session_id": session_id})
+                elif "text" in msg and msg["text"] in ("search_on", "search_off"):
+                    use_search = (msg["text"] == "search_on")
+                    await send_queue.put({"type": "mode", "search": use_search, "session_id": session_id})
 
         async def send_messages():
             while True:
@@ -432,7 +384,6 @@ class TurnDetectionService:
                         await websocket.send_text(json.dumps(payload))
                     except Exception:
                         break
-                    # Keep the WS open across turns; do not break on audio_stream_end
                 except asyncio.TimeoutError:
                     continue
 
