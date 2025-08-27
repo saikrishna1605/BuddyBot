@@ -13,7 +13,7 @@ import websockets
 import google.generativeai as genai
 from starlette.websockets import WebSocketDisconnect
 from services.transcription_cache import add_transcription_to_cache
-from services.skills import handle_weather_query
+from services.skills import handle_weather_query, handle_stock_query
 from services.search import web_search, format_search_summary, speechify_summary
 
 from assemblyai.streaming.v3 import (
@@ -236,6 +236,31 @@ class TurnDetectionService:
                         asyncio.run_coroutine_threadsafe(murf_queue.put({"text": wx}), loop)
                         asyncio.run_coroutine_threadsafe(murf_queue.put({"end": True}), loop)
                     asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_final", "text": wx, "session_id": session_id}), loop)
+                    return
+                # Stock price skill (INR output)
+                try:
+                    # Pass chat memory to allow follow-ups like "and Google?"
+                    stock = asyncio.run(handle_stock_query(text, chat_history=memory))
+                except RuntimeError:
+                    loop2 = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop2)
+                    stock = loop2.run_until_complete(handle_stock_query(text, chat_history=memory))
+                    loop2.close()
+                except Exception:
+                    stock = None
+                if stock:
+                    asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_stream_start", "session_id": session_id, "tts_unavailable": False if self.murf_key else True}), loop)
+                    asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_delta", "text": stock, "session_id": session_id}), loop)
+                    if self.murf_key:
+                        asyncio.run_coroutine_threadsafe(murf_queue.put({"text": stock}), loop)
+                        asyncio.run_coroutine_threadsafe(murf_queue.put({"end": True}), loop)
+                    asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_final", "text": stock, "session_id": session_id}), loop)
+                    try:
+                        memory.append({"role": "assistant", "content": stock})
+                        if len(memory) > 16:
+                            del memory[0:len(memory)-16]
+                    except Exception:
+                        pass
                     return
                 # Search mode
                 if use_search:

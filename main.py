@@ -34,7 +34,7 @@ from assemblyai.streaming.v3 import (
 )
 import google.generativeai as genai
 from services.turn_detection import TurnDetectionService
-from services.skills import handle_weather_query
+from services.skills import handle_weather_query, handle_stock_query
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -274,6 +274,14 @@ async def generate_llm_response(text: str, chat_history: List[ChatMessage] = Non
         except Exception as _e:
             pass
 
+        # Special skill: Stocks (with INR conversion and session memory)
+        try:
+            stock = await handle_stock_query(text, chat_history=chat_history)
+            if stock:
+                return stock, "success"
+        except Exception as _e:
+            pass
+
         # Build persona-driven context
         if chat_history:
             context = (
@@ -328,6 +336,14 @@ async def stream_llm_response(text: str, chat_history: List[ChatMessage] = None)
         wx = await handle_weather_query(text)
         if wx:
             return wx
+    except Exception:
+        pass
+
+    # Special skill: Stocks (non-streaming shortcut)
+    try:
+        stock = await handle_stock_query(text, chat_history=chat_history)
+        if stock:
+            return stock
     except Exception:
         pass
 
@@ -549,6 +565,18 @@ async def relay_llm_stream_to_murf(user_text: str, chat_history: Optional[List[C
             except Exception:
                 pass
             return wx
+    except Exception:
+        pass
+
+    # Special skill: Stocks
+    try:
+        stock = await handle_stock_query(user_text, chat_history=chat_history)
+        if stock:
+            try:
+                await murf_client.send_text(stock, end=True)
+            except Exception:
+                pass
+            return stock
     except Exception:
         pass
 
@@ -1014,6 +1042,21 @@ async def skill_weather(q: str):
             if not data:
                 return {"ok": False, "error": "No data"}
             return {"ok": True, "applies": True, "response": format_weather_response(data)}
+        return {"ok": True, "applies": True, "response": ans}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/skill/stock")
+async def skill_stock(q: str, session_id: Optional[str] = None):
+    """HTTP access to the stock skill. Example: /skill/stock?q=aapl or q=price%20of%20reliance
+
+    If session_id is provided, recent chat history will be used to infer the last ticker if not specified.
+    """
+    try:
+        history = chat_manager.get_history(session_id) if session_id else None
+        ans = await handle_stock_query(q, chat_history=history)
+        if not ans:
+            return {"ok": False, "applies": False, "error": "Not a stock query"}
         return {"ok": True, "applies": True, "response": ans}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
