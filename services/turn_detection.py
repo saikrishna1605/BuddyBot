@@ -15,6 +15,7 @@ from starlette.websockets import WebSocketDisconnect
 from services.transcription_cache import add_transcription_to_cache
 from services.skills import handle_weather_query, handle_stock_query
 from services.search import web_search, format_search_summary, speechify_summary
+from services.config import config as app_config
 
 from assemblyai.streaming.v3 import (
     BeginEvent,
@@ -35,8 +36,9 @@ class TurnDetectionService:
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # Read Murf key at runtime to reflect current env
-        self.murf_key = (os.getenv("MURF_API_KEY") or "").strip('\"\'')
+        # Read Murf key at runtime to reflect current env.
+        # Don't cache permanently; resolve lazily during each stream to pick up UI changes.
+        self.murf_key = (app_config.get("MURF_API_KEY") or "").strip('\"\'')
 
     def create_client(self) -> StreamingClient:
         return StreamingClient(
@@ -170,6 +172,8 @@ class TurnDetectionService:
         client = self.create_client()
 
         async def murf_ws_worker(static_ctx: str):
+            # Refresh Murf key at the start of worker
+            self.murf_key = (app_config.get("MURF_API_KEY") or "").strip('\"\'')
             if not self.murf_key:
                 logger.warning("[TurnDetection] MURF_API_KEY missing; skipping Murf WS TTS")
                 return

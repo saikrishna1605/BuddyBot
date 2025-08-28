@@ -14,6 +14,12 @@ document.addEventListener('DOMContentLoaded', function() {
     const newChatBtn = document.getElementById('newChatBtn');
     const sessionsList = document.getElementById('sessionsList');
     const toggleSearchEl = document.getElementById('toggleSearch');
+    // Settings modal elements
+    const openSettingsBtn = document.getElementById('openSettings');
+    const settingsModal = document.getElementById('settingsModal');
+    const closeSettingsBtn = document.getElementById('closeSettings');
+    const saveSettingsBtn = document.getElementById('saveSettings');
+    const settingsStatus = document.getElementById('settingsStatus');
     
     let mediaRecorder;
     let audioChunks = [];
@@ -475,6 +481,68 @@ document.addEventListener('DOMContentLoaded', function() {
         }
         console.error('Error:', message);
     }
+
+    // ===== Settings Modal Logic =====
+    function openSettings() {
+        if (!settingsModal) return;
+        settingsModal.classList.remove('hidden');
+        // Load masked values from backend to show which keys are set
+        fetch('/config').then(r => r.json()).then((data) => {
+            if (!data || !data.ok) return;
+            const cfg = data.config || {};
+            const ids = [
+                'ASSEMBLYAI_API_KEY','GEMINI_API_KEY','MURF_API_KEY','OPENWEATHER_API_KEY','TAVILY_API_KEY','LLM_MODEL','LLM_TEMPERATURE'
+            ];
+            ids.forEach((k) => {
+                const el = document.getElementById('cfg_' + k);
+                if (!el) return;
+                if (k.endsWith('_API_KEY')) {
+                    el.placeholder = cfg[k] ? ('Set (' + String(cfg[k]) + ')') : 'not set';
+                    el.value = '';
+                } else {
+                    el.value = (cfg[k] ?? '');
+                }
+            });
+        }).catch(() => {});
+    }
+    function closeSettings() {
+        if (!settingsModal) return;
+        settingsModal.classList.add('hidden');
+        if (settingsStatus) settingsStatus.textContent = '';
+    }
+    async function saveSettings() {
+        if (!settingsModal) return;
+        const payload = {};
+        const ids = [
+            'ASSEMBLYAI_API_KEY','GEMINI_API_KEY','MURF_API_KEY','OPENWEATHER_API_KEY','TAVILY_API_KEY','LLM_MODEL','LLM_TEMPERATURE'
+        ];
+        ids.forEach((k) => {
+            const el = document.getElementById('cfg_' + k);
+            if (!el) return;
+            const val = el.value;
+            if (val !== undefined && val !== null && String(val).trim() !== '') {
+                if (k === 'LLM_TEMPERATURE') payload[k] = parseFloat(val);
+                else payload[k] = String(val).trim();
+            }
+        });
+        if (settingsStatus) settingsStatus.textContent = 'Saving...';
+        try {
+            const res = await fetch('/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+            const data = await res.json();
+            if (res.ok && data.ok) {
+                if (settingsStatus) settingsStatus.textContent = 'Saved.';
+                setTimeout(closeSettings, 500);
+            } else {
+                if (settingsStatus) settingsStatus.textContent = data.detail || data.error || 'Failed to save.';
+            }
+        } catch (e) {
+            if (settingsStatus) settingsStatus.textContent = 'Network error.';
+        }
+    }
+    if (openSettingsBtn) openSettingsBtn.addEventListener('click', openSettings);
+    if (closeSettingsBtn) closeSettingsBtn.addEventListener('click', closeSettings);
+    if (settingsModal) settingsModal.addEventListener('click', (e) => { if (e.target === settingsModal) closeSettings(); });
+    if (saveSettingsBtn) saveSettingsBtn.addEventListener('click', saveSettings);
     
     // Sidebar: wire new chat
     if (newChatBtn) newChatBtn.addEventListener('click', startNewChat);

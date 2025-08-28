@@ -35,29 +35,27 @@ from assemblyai.streaming.v3 import (
 import google.generativeai as genai
 from services.turn_detection import TurnDetectionService
 from services.skills import handle_weather_query, handle_stock_query
+from services.config import config as app_config
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load API keys
+# Load API keys and initialize runtime config
 load_dotenv()
-MURF_KEY = os.getenv("MURF_API_KEY")
-ASSEMBLY_KEY = os.getenv("ASSEMBLYAI_API_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-# Allow switching the LLM model without code changes (default remains fast + cheap)
-LLM_MODEL = os.getenv("LLM_MODEL", "gemini-1.5-flash")
-LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.6"))
+app_config.init_from_env()
+app_config.apply_sdks()
 
-# Configure APIs
+MURF_KEY = app_config.get("MURF_API_KEY")
+ASSEMBLY_KEY = app_config.get("ASSEMBLYAI_API_KEY")
+GEMINI_API_KEY = app_config.get("GEMINI_API_KEY")
+
 if ASSEMBLY_KEY:
-    aai.settings.api_key = ASSEMBLY_KEY
     logger.info("AssemblyAI configured successfully")
 else:
     logger.warning("ASSEMBLYAI_API_KEY missing - speech recognition will fail")
 
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
     logger.info("Google Gemini configured successfully")
 else:
     logger.warning("GEMINI_API_KEY missing - AI responses will fail")
@@ -259,7 +257,7 @@ async def transcribe_audio(audio_file) -> Tuple[str, str]:
 async def generate_llm_response(text: str, chat_history: List[ChatMessage] = None) -> Tuple[str, str]:
     """Generate LLM response using Google Gemini with Futuristic AI persona."""
     try:
-        if not GEMINI_API_KEY:
+        if not app_config.get("GEMINI_API_KEY"):
             return "I'm having trouble connecting to my AI brain right now.", "LLM not configured"
 
         # Identity short-circuit
@@ -271,7 +269,7 @@ async def generate_llm_response(text: str, chat_history: List[ChatMessage] = Non
             wx = await handle_weather_query(text)
             if wx:
                 return wx, "success"
-        except Exception as _e:
+        except Exception:
             pass
 
         # Special skill: Stocks (with INR conversion and session memory)
@@ -279,7 +277,7 @@ async def generate_llm_response(text: str, chat_history: List[ChatMessage] = Non
             stock = await handle_stock_query(text, chat_history=chat_history)
             if stock:
                 return stock, "success"
-        except Exception as _e:
+        except Exception:
             pass
 
         # Build persona-driven context
@@ -302,7 +300,9 @@ async def generate_llm_response(text: str, chat_history: List[ChatMessage] = Non
                 "Respond with clarity and a slightly robotic but friendly tone."
             )
 
-        model = genai.GenerativeModel(LLM_MODEL, generation_config={"temperature": LLM_TEMPERATURE})
+        model_name = app_config.get("LLM_MODEL", "gemini-1.5-flash")
+        temperature = float(app_config.get("LLM_TEMPERATURE", 0.6))
+        model = genai.GenerativeModel(model_name, generation_config={"temperature": temperature})
         response = await asyncio.wait_for(
             asyncio.to_thread(model.generate_content, context),
             timeout=LLM_TIMEOUT,
@@ -323,7 +323,7 @@ async def generate_llm_response(text: str, chat_history: List[ChatMessage] = Non
 
 async def stream_llm_response(text: str, chat_history: List[ChatMessage] = None) -> str:
     """Stream LLM response using Google Gemini and return the accumulated text."""
-    if not GEMINI_API_KEY:
+    if not app_config.get("GEMINI_API_KEY"):
         logger.warning("GEMINI_API_KEY missing - cannot stream LLM response")
         return ""
 
@@ -370,7 +370,9 @@ async def stream_llm_response(text: str, chat_history: List[ChatMessage] = None)
 
     def _run_streaming() -> str:
         try:
-            model = genai.GenerativeModel(LLM_MODEL, generation_config={"temperature": LLM_TEMPERATURE})
+            model_name = app_config.get("LLM_MODEL", "gemini-1.5-flash")
+            temperature = float(app_config.get("LLM_TEMPERATURE", 0.6))
+            model = genai.GenerativeModel(model_name, generation_config={"temperature": temperature})
             stream = model.generate_content(context, stream=True)
             full: List[str] = []
             for chunk in stream:
@@ -395,16 +397,15 @@ async def stream_tts_via_murf_ws(text: str, *, voice_id: str = "en-US-amara", sa
 
     If context_id is provided, it will be included in the messages to reuse a single context.
     """
-    if not MURF_KEY:
+    if not app_config.get("MURF_API_KEY"):
         logger.warning("MURF_API_KEY missing - cannot stream TTS via Murf WebSocket")
         return
 
     if not text:
-        logger.info("No text provided to TTS stream")
         return
 
     # Build connection URL with query params
-    qs = f"?api-key={MURF_KEY.strip('\"\'')}\u0026sample_rate={sample_rate}\u0026channel_type={channel_type}\u0026format={fmt}"
+    qs = f"?api-key={(app_config.get('MURF_API_KEY') or '').strip('\"\'')}\u0026sample_rate={sample_rate}\u0026channel_type={channel_type}\u0026format={fmt}"
     ws_url = f"{MURF_WS_URL}{qs}"
 
     try:
@@ -544,7 +545,7 @@ class MurfWsClient:
 
 async def relay_llm_stream_to_murf(user_text: str, chat_history: Optional[List[ChatMessage]], *, murf_client: MurfWsClient) -> str:
     """Stream Gemini LLM response chunks and forward them to Murf over WS."""
-    if not GEMINI_API_KEY:
+    if not app_config.get("GEMINI_API_KEY"):
         return ""
 
     # Identity short-circuit
@@ -606,7 +607,9 @@ async def relay_llm_stream_to_murf(user_text: str, chat_history: Optional[List[C
 
     def _run_and_forward():
         try:
-            model = genai.GenerativeModel(LLM_MODEL, generation_config={"temperature": LLM_TEMPERATURE})
+            model_name = app_config.get("LLM_MODEL", "gemini-1.5-flash")
+            temperature = float(app_config.get("LLM_TEMPERATURE", 0.6))
+            model = genai.GenerativeModel(model_name, generation_config={"temperature": temperature})
             stream = model.generate_content(context, stream=True)
             for chunk in stream:
                 part = getattr(chunk, "text", "") or ""
@@ -629,33 +632,33 @@ async def relay_llm_stream_to_murf(user_text: str, chat_history: Optional[List[C
 async def generate_speech(text: str, voice_id: str = "en-US-natalie") -> Tuple[Optional[str], str]:
     """Generate speech using Murf AI"""
     try:
-        if not MURF_KEY:
+        if not app_config.get("MURF_API_KEY"):
             return None, "TTS not configured"
-        
+
         if not text or len(text) > 5000:
             return None, "Invalid text for TTS"
-        
+
         headers = {
-            "api-key": MURF_KEY.strip('"\''),
-            "Content-Type": "application/json"
+            "api-key": (app_config.get("MURF_API_KEY") or "").strip('\"\''),
+            "Content-Type": "application/json",
         }
-        
+
         payload = {
             "text": text,
             "voiceId": voice_id,
             "format": "MP3",
-            "sampleRate": 44100
+            "sampleRate": 44100,
         }
-        
+
         async with httpx.AsyncClient(timeout=TTS_TIMEOUT) as client:
             response = await client.post(MURF_API_URL, json=payload, headers=headers)
-            
+
             if response.status_code == 200:
                 result = response.json()
                 return result.get("audioFile"), "success"
             else:
                 return None, f"TTS API error: {response.status_code}"
-                
+
     except asyncio.TimeoutError:
         return None, "TTS timeout"
     except Exception as e:
@@ -710,7 +713,8 @@ async def streaming_ws(websocket: WebSocket):
     
     session_id = f"streaming_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
-    if not ASSEMBLY_KEY:
+    assembly_key_runtime = app_config.get("ASSEMBLYAI_API_KEY")
+    if not assembly_key_runtime:
         await websocket.send_text(json.dumps({"type": "error", "message": "AssemblyAI API key not configured"}))
         await websocket.close()
         return
@@ -724,7 +728,7 @@ async def streaming_ws(websocket: WebSocket):
     # Create streaming client with the new Universal Streaming API
     streaming_client = StreamingClient(
         StreamingClientOptions(
-            api_key=ASSEMBLY_KEY,
+            api_key=assembly_key_runtime,
             api_host="streaming.assemblyai.com"
         )
     )
@@ -981,7 +985,7 @@ async def streaming_ws(websocket: WebSocket):
 @app.websocket("/ws/turn-detection")
 async def turn_detection_ws(websocket: WebSocket):
     """Separate endpoint for Day 18: Turn Detection (no overlap with main pipeline)."""
-    if not ASSEMBLY_KEY:
+    if not app_config.get("ASSEMBLYAI_API_KEY"):
         await websocket.accept()
         await websocket.send_text(json.dumps({
             "type": "error",
@@ -990,7 +994,7 @@ async def turn_detection_ws(websocket: WebSocket):
         await websocket.close()
         return
 
-    service = TurnDetectionService(api_key=ASSEMBLY_KEY)
+    service = TurnDetectionService(api_key=app_config.get("ASSEMBLYAI_API_KEY") or "")
     # Delegate all handling to the focused service
     await service.stream_handler(websocket, ASSEMBLY_KEY)
 @app.get("/", response_class=HTMLResponse)
@@ -1009,9 +1013,9 @@ async def read_root():
 async def health_check():
     """Health check endpoint"""
     services = {
-        "speech_to_text": "available" if ASSEMBLY_KEY else "unavailable",
-        "llm": "available" if GEMINI_API_KEY else "unavailable",
-        "text_to_speech": "available" if MURF_KEY else "unavailable"
+        "speech_to_text": "available" if app_config.get("ASSEMBLYAI_API_KEY") else "unavailable",
+        "llm": "available" if app_config.get("GEMINI_API_KEY") else "unavailable",
+        "text_to_speech": "available" if app_config.get("MURF_API_KEY") else "unavailable"
     }
     
     available_count = sum(1 for status in services.values() if status == "available")
@@ -1027,6 +1031,46 @@ async def health_check():
         message = "All services unavailable"
     
     return HealthResponse(status=overall_status, services=services, message=message)
+
+
+# ===== RUNTIME CONFIG ENDPOINTS =====
+@app.get("/config")
+async def get_config():
+    """Return masked configuration for UI display."""
+    try:
+        return {"ok": True, "config": app_config.get_all_masked()}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+class UpdateConfigRequest(BaseModel):
+    ASSEMBLYAI_API_KEY: Optional[str] = None
+    GEMINI_API_KEY: Optional[str] = None
+    MURF_API_KEY: Optional[str] = None
+    OPENWEATHER_API_KEY: Optional[str] = None
+    TAVILY_API_KEY: Optional[str] = None
+    LLM_MODEL: Optional[str] = None
+    LLM_TEMPERATURE: Optional[float] = None
+
+
+@app.post("/config")
+async def update_config(payload: UpdateConfigRequest):
+    """Update API keys and model settings at runtime."""
+    data = payload.dict(exclude_none=True)
+    # Basic normalization: strip quotes/spaces on keys
+    for k in list(data.keys()):
+        if k.endswith("_API_KEY") and isinstance(data[k], str):
+            data[k] = data[k].strip().strip('"\'')
+    try:
+        changed = app_config.set_many(data)
+        # Refresh local references used in module scope
+        global MURF_KEY, ASSEMBLY_KEY, GEMINI_API_KEY
+        MURF_KEY = app_config.get("MURF_API_KEY")
+        ASSEMBLY_KEY = app_config.get("ASSEMBLYAI_API_KEY")
+        GEMINI_API_KEY = app_config.get("GEMINI_API_KEY")
+        return {"ok": True, "changed": changed, "config": app_config.get_all_masked()}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/skill/weather")
 async def skill_weather(q: str):
@@ -1227,9 +1271,9 @@ async def startup_event():
     logger.info("BuddyBot - AI Voice Assistant Starting Up")
     logger.info("=" * 50)
     logger.info(f"Host: {HOST}:{PORT}")
-    logger.info(f"AssemblyAI: {'Configured' if ASSEMBLY_KEY else 'Missing'}")
-    logger.info(f"Gemini LLM: {'Configured' if GEMINI_API_KEY else 'Missing'}")
-    logger.info(f"Murf TTS: {'Configured' if MURF_KEY else 'Missing'}")
+    logger.info(f"AssemblyAI: {'Configured' if app_config.get('ASSEMBLYAI_API_KEY') else 'Missing'}")
+    logger.info(f"Gemini LLM: {'Configured' if app_config.get('GEMINI_API_KEY') else 'Missing'}")
+    logger.info(f"Murf TTS: {'Configured' if app_config.get('MURF_API_KEY') else 'Missing'}")
     logger.info("BuddyBot is ready to chat!")
     logger.info(f"Open: http://{HOST}:{PORT}")
     logger.info("=" * 50)

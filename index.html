@@ -15,6 +15,7 @@
             <h1>Murf AI</h1>
             <h2>Conversational AI Assistant</h2>
             <!-- <p> </p> -->
+            <button id="openSettings" type="button" class="settings-btn" title="Settings">⚙️ Settings</button>
         </header>
         
         <div class="content">
@@ -98,6 +99,51 @@
             </div>
 
             </main>
+        </div>
+    </div>
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="modal hidden" role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h3 id="settingsTitle">Configuration</h3>
+                <button id="closeSettings" class="close-btn" title="Close">✕</button>
+            </div>
+            <div class="modal-body">
+                <div class="grid-2">
+                    <label>
+                        AssemblyAI API Key
+                        <input id="cfg_ASSEMBLYAI_API_KEY" type="password" placeholder="sk_..." autocomplete="off" />
+                    </label>
+                    <label>
+                        Google Gemini API Key
+                        <input id="cfg_GEMINI_API_KEY" type="password" placeholder="AIza..." autocomplete="off" />
+                    </label>
+                    <label>
+                        Murf API Key
+                        <input id="cfg_MURF_API_KEY" type="password" placeholder="murf_..." autocomplete="off" />
+                    </label>
+                    <label>
+                        OpenWeather API Key
+                        <input id="cfg_OPENWEATHER_API_KEY" type="password" placeholder="owm_..." autocomplete="off" />
+                    </label>
+                    <label>
+                        Tavily API Key
+                        <input id="cfg_TAVILY_API_KEY" type="password" placeholder="tvly_..." autocomplete="off" />
+                    </label>
+                    <label>
+                        LLM Model
+                        <input id="cfg_LLM_MODEL" type="text" placeholder="gemini-1.5-flash" />
+                    </label>
+                    <label>
+                        Temperature
+                        <input id="cfg_LLM_TEMPERATURE" type="number" step="0.1" min="0" max="2" placeholder="0.6" />
+                    </label>
+                </div>
+                <div class="modal-actions">
+                    <button id="saveSettings" class="primary">Save</button>
+                    <span id="settingsStatus" class="settings-status" aria-live="polite"></span>
+                </div>
+            </div>
         </div>
     </div>
     <script src="/static/script.js?v=3.2.0"></script>

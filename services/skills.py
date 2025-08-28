@@ -1,8 +1,8 @@
-import os
 import re
 import httpx
 import math
 from typing import Optional, Tuple, Dict, Any, List
+from services.config import config as app_config
 
 
 def extract_weather_location(query: str) -> Optional[str]:
@@ -44,7 +44,7 @@ async def fetch_weather(location: str, *, timeout: float = 8.0) -> Tuple[Optiona
     """
     if not location:
         return None, "No location provided"
-    api_key = (os.getenv("OPENWEATHER_API_KEY") or "").strip('"\'')
+    api_key = (app_config.get("OPENWEATHER_API_KEY") or "").strip('"\'')
     if not api_key:
         return None, "OPENWEATHER_API_KEY not configured"
     try:

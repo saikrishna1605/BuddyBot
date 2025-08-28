@@ -1,11 +1,11 @@
-import os
 import httpx
 from typing import Any, Dict, List, Optional, Tuple
+from services.config import config as app_config
 
 
 async def web_search(query: str, *, max_results: int = 5, timeout: float = 10.0) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """Call Tavily search API to get an answer and sources. Returns (data, error)."""
-    api_key = (os.getenv("TAVILY_API_KEY") or "").strip('\"\'')
+    api_key = (app_config.get("TAVILY_API_KEY") or "").strip('\"\'')
     if not api_key:
         return None, "TAVILY_API_KEY not configured"
     if not query or not query.strip():
