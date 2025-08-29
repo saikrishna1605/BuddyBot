@@ -7,10 +7,6 @@ import google.generativeai as genai
 
 
 class _AppConfig:
-    """Thread-safe runtime configuration for API keys and model settings.
-
-    Prefers user-provided values set at runtime; falls back to environment variables.
-    """
 
     def __init__(self) -> None:
         self._lock = threading.RLock()
@@ -40,7 +36,6 @@ class _AppConfig:
                     self._values[k] = env_v
 
     def set_many(self, data: Dict[str, Any]) -> Dict[str, bool]:
-        """Update multiple config values; returns which SDKs were reconfigured."""
         changed = {}
         with self._lock:
             for key, val in (data or {}).items():

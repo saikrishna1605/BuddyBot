@@ -4,7 +4,6 @@ from services.config import config as app_config
 
 
 async def web_search(query: str, *, max_results: int = 5, timeout: float = 10.0) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Call Tavily search API to get an answer and sources. Returns (data, error)."""
     api_key = (app_config.get("TAVILY_API_KEY") or "").strip('\"\'')
     if not api_key:
         return None, "TAVILY_API_KEY not configured"
@@ -32,9 +31,7 @@ async def web_search(query: str, *, max_results: int = 5, timeout: float = 10.0)
 
 
 def format_search_summary(data: Dict[str, Any]) -> Tuple[str, List[Dict[str, str]]]:
-    """Extract a concise summary and a normalized list of sources from Tavily result."""
     answer = (data.get("answer") or "").strip()
-    # Normalize sources
     raw_sources = data.get("results") or []
     sources: List[Dict[str, str]] = []
     for r in raw_sources:
@@ -43,10 +40,8 @@ def format_search_summary(data: Dict[str, Any]) -> Tuple[str, List[Dict[str, str
         snippet = (r.get("content") or r.get("snippet") or "").strip()
         if url:
             sources.append({"title": title[:120], "url": url, "snippet": snippet[:240]})
-    # Keep top 5
     sources = sources[:5]
     if not answer:
-        # Fallback to a brief synthesis from titles
         if sources:
             answer = "Here’s a concise readout from the top results."
         else:
@@ -55,7 +50,6 @@ def format_search_summary(data: Dict[str, Any]) -> Tuple[str, List[Dict[str, str
 
 
 def speechify_summary(text: str) -> str:
-    """Trim search summary for speech: concise and friendly."""
     t = (text or "").strip()
     if len(t) > 600:
         t = t[:560].rstrip() + ". More details are available in the sources."

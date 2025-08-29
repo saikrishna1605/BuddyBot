@@ -1,9 +1,6 @@
-# Environment variables
 .env
 .env.local
 .env.*.local
-
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -27,26 +24,18 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
-
-# Virtual environments
 venv/
 env/
 ENV/
 env.bak/
 venv.bak/
-
-# IDE
 .vscode/
 .idea/
 *.swp
 *.swo
 *~
-
-# Logs
 *.log
 app.log
-
-# OS
 .DS_Store
 .DS_Store?
 ._*
@@ -54,18 +43,13 @@ app.log
 .Trashes
 ehthumbs.db
 Thumbs.db
-
-# Temporary files / uploads
 uploads/*.wav
 uploads/*.mp3
 uploads/*.m4a
 uploads/*.flac
 uploads/*.webm
-# Catch-all ignore for uploads; keep .gitkeep
 uploads/*
 !uploads/.gitkeep
-
-# Test coverage
 htmlcov/
 .tox/
 .coverage
@@ -77,44 +61,19 @@ coverage.xml
 *.py,cover
 .hypothesis/
 .pytest_cache/
-
-# Jupyter Notebook
 .ipynb_checkpoints
-
-# pyenv
 .python-version
-
-# pipenv
 Pipfile.lock
-
-# PEP 582
 __pypackages__/
-
-# Celery
 celerybeat-schedule
 celerybeat.pid
-
-# SageMath parsed files
 *.sage.py
-
-# Spyder project settings
 .spyderproject
 .spyproject
-
-# Rope project settings
 .ropeproject
-
-# mkdocs documentation
 /site
-
-# mypy
 .mypy_cache/
 .dmypy.json
 dmypy.json
-
-# Pyre type checker
 .pyre/
-
-
-
 static/fallback.mp3

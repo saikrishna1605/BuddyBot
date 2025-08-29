@@ -6,14 +6,9 @@ from services.config import config as app_config
 
 
 def extract_weather_location(query: str) -> Optional[str]:
-    """Extract a location from natural queries. Returns None if no clear city is present.
-
-    Avoids guessing from generic capitalized phrases like "What Is The" or "Right Now".
-    """
     if not query:
         return None
     q = query.strip().lower()
-    # Common, explicit patterns
     patterns = [
         r"weather\s+in\s+([a-z\s,]+)",
         r"temperature\s+in\s+([a-z\s,]+)",
@@ -25,23 +20,15 @@ def extract_weather_location(query: str) -> Optional[str]:
         m = re.search(p, q)
         if m:
             city = m.group(1)
-            # Strip trailing time words like "right now"
             city = stop_trailing.sub("", city)
-            # Remove stray punctuation/commas/spaces
             city = re.sub(r"[^a-z\s,]", " ", city)
             city = re.sub(r"\s+", " ", city).strip(" ,")
             if city and len(city) >= 2:
                 return city.title()
-    # No safe match: do not guess from capitalization; require explicit pattern
     return None
 
 
 async def fetch_weather(location: str, *, timeout: float = 8.0) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Fetch current weather from OpenWeatherMap by city name (metric units).
-
-    Env: OPENWEATHER_API_KEY must be set.
-    Returns (data, error). If error is not None, data will be None.
-    """
     if not location:
         return None, "No location provided"
     api_key = (app_config.get("OPENWEATHER_API_KEY") or "").strip('"\'')
@@ -49,7 +36,6 @@ async def fetch_weather(location: str, *, timeout: float = 8.0) -> Tuple[Optiona
         return None, "OPENWEATHER_API_KEY not configured"
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
-            # Support inputs like "City" or "City, CountryCode"
             params = {"q": location, "appid": api_key, "units": "metric"}
             res = await client.get("https://api.openweathermap.org/data/2.5/weather", params=params)
             if res.status_code == 404:
@@ -65,7 +51,6 @@ async def fetch_weather(location: str, *, timeout: float = 8.0) -> Tuple[Optiona
             clouds = (r.get("clouds") or {}).get("all")
             weather_arr = r.get("weather") or []
             desc = weather_arr[0].get("description") if weather_arr else None
-            # Convert wind speed m/s -> km/h
             wind_kmh = (wind.get("speed") or 0) * 3.6
             data = {
                 "resolved_name": f"{name}, {country}" if country else name,
@@ -86,7 +71,6 @@ async def fetch_weather(location: str, *, timeout: float = 8.0) -> Tuple[Optiona
 
 
 def format_weather_response(data: Dict[str, Any]) -> str:
-    """Compose a concise, futuristic weather summary."""
     name = data.get("resolved_name") or "your location"
     t = data.get("temperature_c")
     feels = data.get("apparent_c")
@@ -94,7 +78,6 @@ def format_weather_response(data: Dict[str, Any]) -> str:
     clouds = data.get("cloud_cover")
     cond = data.get("conditions")
     wind = data.get("wind_kmh")
-    # Build descriptors
     parts = []
     if t is not None:
         parts.append(f"{t:.1f}°C")
@@ -115,10 +98,8 @@ def format_weather_response(data: Dict[str, Any]) -> str:
 
 
 async def handle_weather_query(query: str) -> Optional[str]:
-    """High-level handler: detect location, fetch, and format a response. Returns None if not applicable."""
     loc = extract_weather_location(query or "")
     if not loc:
-        # Only treat as weather if the word appears
         if "weather" not in (query or "").lower() and "temperature" not in (query or "").lower():
             return None
         return "I can fetch live weather. Say a city — e.g., 'weather in Bangalore' or 'Mumbai weather'."
@@ -130,39 +111,29 @@ async def handle_weather_query(query: str) -> Optional[str]:
     return format_weather_response(data)
 
 
-# ===== STOCK PRICE SKILL =====
-
 def _extract_ticker_candidates(query: str) -> List[str]:
-    """Extract likely ticker symbols from the text. Handles formats like 'AAPL', 'TSLA', 'RELIANCE.NS' etc.
-    Also accepts phrasing like 'price of AAPL', 'AAPL price', 'check TCS stock'.
-    """
+    
     if not query:
         return []
     q = (query or "").strip()
-    # Look for patterns including .NS suffix for NSE, .BO for BSE
-    # Simple heuristic: contiguous alphanumerics with optional dot+suffix, 1-6 letters + optional suffix
     pattern = re.compile(r"\b([A-Za-z]{1,6}(?:\.(?:NS|ns|BO|bo))?)\b")
-    # Prefer words near 'stock', 'share', 'price'
     near = re.findall(r"(?:stock|share|price|quote)\s+(of\s+)?([A-Za-z.]{1,10})", q, re.I)
     cands = []
     for _, sym in near:
         cands.append(sym)
     for m in pattern.finditer(q):
         cands.append(m.group(1))
-    # Normalize deductions
     norm: List[str] = []
     STOP = {
         "PRICE","STOCK","SHARE","QUOTE","WHAT","SHOW","OF","THE","IN","ON","IS","AND","TO","FROM","PLEASE","TELL","ME","CHECK","CURRENT","TODAY","NOW","ABOUT","A","AN"
     }
     for c in cands:
         c = c.strip().upper()
-        # Filter out common words that match regex accidentally
         if c in STOP:
             continue
         if len(c) < 1:
             continue
         norm.append(c)
-    # De-dup preserving order
     seen = set()
     out = []
     for s in norm:
@@ -173,9 +144,6 @@ def _extract_ticker_candidates(query: str) -> List[str]:
 
 
 async def _get_inr_rate(*, timeout: float = 6.0) -> float:
-    """Fetch USD->INR FX rate. yfinance returns USD-denominated for most US tickers.
-    We'll fetch from a public endpoint (no key) to avoid heavy deps. Fallback to 83.0 if fail.
-    """
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             r = await client.get("https://open.er-api.com/v6/latest/USD")
@@ -191,11 +159,8 @@ async def _get_inr_rate(*, timeout: float = 6.0) -> float:
 
 
 async def _fetch_stock_price_yf(ticker: str, *, timeout: float = 8.0) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """Fetch stock price using yfinance. Returns dict with price, currency, exchange info.
-    We import lazily to keep import cost low at startup.
-    """
     try:
-        import yfinance as yf  # type: ignore
+        import yfinance as yf
     except Exception as e:
         return None, f"yfinance not installed: {e}"
 
@@ -204,7 +169,6 @@ async def _fetch_stock_price_yf(ticker: str, *, timeout: float = 8.0) -> Tuple[O
         price = None
         currency = None
         exchange = None
-        # Try fast_info but guard against internal attr errors
         try:
             info = getattr(tk, "fast_info", None)
             if info is not None:
@@ -212,7 +176,6 @@ async def _fetch_stock_price_yf(ticker: str, *, timeout: float = 8.0) -> Tuple[O
                 currency = getattr(info, "currency", None)
                 exchange = getattr(info, "exchange", None)
         except Exception:
-            # Ignore fast_info issues; fall back to history
             price = None
         if price is None:
             try:
@@ -222,7 +185,6 @@ async def _fetch_stock_price_yf(ticker: str, *, timeout: float = 8.0) -> Tuple[O
             except Exception:
                 pass
         if price is None:
-            # Try a slightly longer window
             try:
                 hist = tk.history(period="5d")
                 if hist is not None and not hist.empty:
@@ -237,7 +199,6 @@ async def _fetch_stock_price_yf(ticker: str, *, timeout: float = 8.0) -> Tuple[O
 
 
 _COMPANY_MAP = {
-    # US tech
     "apple": "AAPL",
     "alphabet": "GOOGL",
     "google": "GOOGL",
@@ -246,7 +207,6 @@ _COMPANY_MAP = {
     "tesla": "TSLA",
     "nvidia": "NVDA",
     "meta": "META",
-    # India large caps (NSE)
     "reliance": "RELIANCE.NS",
     "tcs": "TCS.NS",
     "infosys": "INFY.NS",
@@ -259,9 +219,7 @@ _COMPANY_MAP = {
 
 
 async def _search_ticker_yahoo(query: str, *, timeout: float = 6.0) -> Optional[str]:
-    """Hit Yahoo Finance suggestion API to resolve a company/name to a ticker symbol."""
     q = (query or "").strip()
-    # Strip common prefixes like $AAPL -> AAPL
     if q.startswith("$") and len(q) > 1:
         q = q[1:]
     if not q:
@@ -277,10 +235,8 @@ async def _search_ticker_yahoo(query: str, *, timeout: float = 6.0) -> Optional[
                 return None
             data = r.json() or {}
             quotes = data.get("quotes") or []
-            # Prefer equities first
             equities = [it for it in quotes if (it.get("quoteType") or "").upper() == "EQUITY" and it.get("symbol")]
             if equities:
-                # Heuristic: prefer US exchanges for US tech names; NSE for Indian names
                 lower = q.lower()
                 def score(it):
                     sym = (it.get("symbol") or "").upper()
@@ -295,7 +251,6 @@ async def _search_ticker_yahoo(query: str, *, timeout: float = 6.0) -> Optional[
                     return s
                 equities.sort(key=score, reverse=True)
                 return str(equities[0]["symbol"]).upper()
-            # Fallback: first result with symbol
             for item in quotes:
                 if item.get("symbol"):
                     return str(item["symbol"]).upper()
@@ -305,14 +260,10 @@ async def _search_ticker_yahoo(query: str, *, timeout: float = 6.0) -> Optional[
 
 
 def _remember_ticker(chat_history: Optional[List[Dict[str, Any]]], found: List[str]) -> Optional[str]:
-    """Try to infer or remember ticker from history if not explicitly provided.
-    chat_history is a list of ChatMessage-like dicts with 'role' and 'content'.
-    """
     if found:
         return found[0]
     if not chat_history:
         return None
-    # Scan from the end for a previously mentioned explicit symbol pattern
     for msg in reversed(chat_history[-8:]):
         content = (getattr(msg, "content", None) or msg.get("content") if isinstance(msg, dict) else None) or ""
         cands = _extract_ticker_candidates(content)
@@ -326,70 +277,50 @@ def _format_stock_response(data: Dict[str, Any], inr_rate: float) -> str:
     currency = (data.get("currency") or "USD").upper()
     ticker = data.get("ticker") or ""
     ex = data.get("exchange") or ""
-    # Convert to INR if not already INR
     if currency != "INR":
         inr_price = price * inr_rate if (price is not None and inr_rate > 0) else None
     else:
         inr_price = price
     if inr_price is None:
         return f"{ticker}: price unavailable."
-    # Round to 2 decimals, add thousands separators
     inr_display = f"₹{inr_price:,.2f}"
     return f"{ticker} current price: {inr_display}."
 
 
 async def handle_stock_query(query: str, chat_history: Optional[List[Any]] = None) -> Optional[str]:
-    """High-level stock handler.
-    - Detects if the user's query is about stock price.
-    - Extracts or infers the ticker.
-    - Fetches live price via yfinance.
-    - Converts to INR by default.
-    - Remembers the ticker within the ongoing chat.
-    Returns None if the query doesn't look like a stock request.
-    """
     q = (query or "").strip()
     if not q:
         return None
     lower = q.lower()
     if not ("stock" in lower or "share" in lower or "price" in lower or "quote" in lower):
-        # Not a stock intent
         return None
 
-    # Gather candidates and memory
     cands = _extract_ticker_candidates(q)
     mem_ticker = _remember_ticker(chat_history, cands)
     ticker = None
-    # 1) If any candidate has explicit exchange suffix (.NS/.BO), prefer it
     for c in cands:
         if re.search(r"\.(?:NS|BO)$", c, re.I):
             ticker = c
             break
-    # 2) Company name mapping from the query text
     if not ticker:
         for name, sym in _COMPANY_MAP.items():
             if name in lower:
                 ticker = sym
                 break
-    # 3) If memory provided and looks like a proper ticker, use it
     if not ticker and mem_ticker:
         ticker = mem_ticker
-    # 4) Yahoo search by full query
     if not ticker:
         ticker = await _search_ticker_yahoo(q)
-    # 5) Yahoo search by first candidate
     if not ticker and cands:
         ticker = await _search_ticker_yahoo(cands[0])
     if not ticker:
         return "Tell me the ticker symbol — e.g., 'price of AAPL', 'RELIANCE.NS stock'."
-    # Validate/normalize ticker
     ticker = ticker.strip().upper()
     if not re.fullmatch(r"[A-Z]{1,10}(?:\.(?:NS|BO))?", ticker):
-        # If the symbol has unexpected chars, try cleaning and fallback to search
         t2 = re.sub(r"[^A-Za-z\.]+", "", ticker)
         if re.fullmatch(r"[A-Z]{1,10}(?:\.(?:NS|BO))?", t2):
             ticker = t2
         else:
-            # As last resort, search by original query
             t3 = await _search_ticker_yahoo(q)
             if t3:
                 ticker = t3

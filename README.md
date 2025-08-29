@@ -104,7 +104,7 @@ MURF_API_KEY=your_actual_murf_api_key
 python main.py
 ```
 
-6. Open your web browser and go to: http://localhost:8000
+6. Open your web browser and go to: http://localhost:8080
 
 That's it! If everything worked, you should see a nice looking page with a big record button.
 
@@ -133,6 +133,28 @@ The application provides a comprehensive REST API:
 **POST /generate-audio**: Convert text to speech
 **POST /llm/query**: Query AI with audio input
 **GET /health**: Check system status and API availability
+
+## Deploying to Render (Free Tier)
+
+Fast path:
+
+- Push this repo to GitHub
+- In Render, create a new Web Service from your repo
+- When asked, set:
+    - Build Command: `pip install -r requirements.txt`
+    - Start Command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+    - Runtime: Python 3.11
+- Add Environment Variables (from your `.env`): `ASSEMBLYAI_API_KEY`, `GEMINI_API_KEY`, `MURF_API_KEY`, `OPENWEATHER_API_KEY`, `TAVILY_API_KEY`
+
+This repo includes a `render.yaml` so you can also click “New +” → “Blueprint” and point to the repo; Render will auto-provision using the settings above. Health check path is `/health`.
+
+Notes:
+
+- Public URL will be HTTPS; the app serves the UI at `/` and static files at `/static`
+- WebSockets endpoints used by the UI:
+    - `/ws/turn-detection` (primary)
+    - `/ws/streaming` (advanced, optional)
+- Ensure your browser allows microphone access when visiting the Render URL
 
 ## Project Structure
 

@@ -32,12 +32,8 @@ logger = logging.getLogger(__name__)
 MURF_WS_URL = "wss://api.murf.ai/v1/speech/stream-input"
 
 class TurnDetectionService:
-    """Encapsulates AssemblyAI Universal Streaming turn detection."""
-
     def __init__(self, api_key: str):
         self.api_key = api_key
-        # Read Murf key at runtime to reflect current env.
-        # Don't cache permanently; resolve lazily during each stream to pick up UI changes.
         self.murf_key = (app_config.get("MURF_API_KEY") or "").strip('\"\'')
 
     def create_client(self) -> StreamingClient:
@@ -54,10 +50,8 @@ class TurnDetectionService:
             format_turns=True,
             encoding="pcm_s16le",
         )
-        logger.info(
-            f"[TurnDetection] Connecting with encoding={params.encoding}, sample_rate={params.sample_rate}"
-        )
-        client.connect(params)
+    logger.info(f"[TurnDetection] Connecting with encoding={params.encoding}, sample_rate={params.sample_rate}")
+    client.connect(params)
 
     def wire_handlers(
         self,
@@ -69,7 +63,6 @@ class TurnDetectionService:
         state: Optional[dict] = None,
     ) -> None:
         latest_partial: Optional[str] = None
-        # Track last finalized turn to prevent duplicate finals (e.g., unformatted + formatted)
         if state is not None and "last_final_turn" not in state:
             state["last_final_turn"] = None
 
@@ -93,7 +86,6 @@ class TurnDetectionService:
                         loop,
                     )
                 elif event.end_of_turn and event.transcript:
-                    # Deduplicate: skip if we've already finalized this turn_order
                     if state is not None and state.get("last_final_turn") == event.turn_order:
                         return
                     if state is not None:
@@ -101,7 +93,6 @@ class TurnDetectionService:
                     final_text = event.transcript
                     if state is not None:
                         state["last_final_turn"] = event.turn_order
-                    # Record final transcript to cache for fallback retrieval
                     try:
                         add_transcription_to_cache(final_text, session_id)
                     except Exception:
@@ -158,7 +149,6 @@ class TurnDetectionService:
         client.on(StreamingEvents.Error, on_error)
 
     async def stream_handler(self, websocket, api_key: str):
-        """Turn detection WS with pause/resume, search toggle, memory, and LLM→Murf streaming."""
         await websocket.accept()
         session_id = f"turn_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         loop = asyncio.get_running_loop()
@@ -172,7 +162,6 @@ class TurnDetectionService:
         client = self.create_client()
 
         async def murf_ws_worker(static_ctx: str):
-            # Refresh Murf key at the start of worker
             self.murf_key = (app_config.get("MURF_API_KEY") or "").strip('\"\'')
             if not self.murf_key:
                 logger.warning("[TurnDetection] MURF_API_KEY missing; skipping Murf WS TTS")
@@ -216,14 +205,12 @@ class TurnDetectionService:
             try:
                 if not text or not text.strip():
                     return
-                # Update memory with user message
                 try:
                     memory.append({"role": "user", "content": text})
                     if len(memory) > 16:
                         del memory[0:len(memory)-16]
                 except Exception:
                     pass
-                # Weather skill
                 try:
                     wx = asyncio.run(handle_weather_query(text))
                 except RuntimeError:
@@ -241,9 +228,7 @@ class TurnDetectionService:
                         asyncio.run_coroutine_threadsafe(murf_queue.put({"end": True}), loop)
                     asyncio.run_coroutine_threadsafe(send_queue.put({"type": "assistant_final", "text": wx, "session_id": session_id}), loop)
                     return
-                # Stock price skill (INR output)
                 try:
-                    # Pass chat memory to allow follow-ups like "and Google?"
                     stock = asyncio.run(handle_stock_query(text, chat_history=memory))
                 except RuntimeError:
                     loop2 = asyncio.new_event_loop()
@@ -266,7 +251,6 @@ class TurnDetectionService:
                     except Exception:
                         pass
                     return
-                # Search mode
                 if use_search:
                     try:
                         try:
@@ -295,7 +279,6 @@ class TurnDetectionService:
                             return
                     except Exception:
                         pass
-                # Normal LLM
                 prompt = "You are a helpful assistant. Answer the user's request clearly, concisely, and conversationally.\n"
                 try:
                     if memory:
