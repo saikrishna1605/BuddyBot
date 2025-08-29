@@ -50,8 +50,10 @@ class TurnDetectionService:
             format_turns=True,
             encoding="pcm_s16le",
         )
-    logger.info(f"[TurnDetection] Connecting with encoding={params.encoding}, sample_rate={params.sample_rate}")
-    client.connect(params)
+        logger.info(
+            f"[TurnDetection] Connecting with encoding={params.encoding}, sample_rate={params.sample_rate}"
+        )
+        client.connect(params)
 
     def wire_handlers(
         self,
